@@ -1,0 +1,43 @@
+{
+  "name": "trees-cli",
+  "version": "0.1.0",
+  "description": "类人脑的 AI 经验生态 —— 项目长成大树，经验结成种子。零依赖、本地优先、纯文件存储。",
+  "type": "module",
+  "bin": {
+    "trees": "./bin/cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "author": "张子翔 <zzx060427@outlook.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lim-life/Trees.git"
+  },
+  "homepage": "https://github.com/lim-life/Trees#readme",
+  "bugs": {
+    "url": "https://github.com/lim-life/Trees/issues",
+    "email": "zzx060427@outlook.com"
+  },
+  "keywords": [
+    "ai-agents",
+    "memory",
+    "knowledge-management",
+    "llm",
+    "second-brain",
+    "markdown",
+    "zero-dependency"
+  ],
+  "scripts": {
+    "test": "node tests/run.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "tests/",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {}
+}

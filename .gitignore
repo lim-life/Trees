@@ -1,0 +1,17 @@
+# 依赖（本项目零依赖，但别人可能装东西）
+node_modules/
+package-lock.json
+
+# 数据区：种子/大树是你自己的经验资产，默认不进仓库
+**/forest/seeds/
+**/forest/trees/
+**/forest/box/
+**/forest/leaves.log
+**/forest/config.json   # 里面可能有你的 API key
+
+# 临时文件
+*.tmp
+*.log
+!examples/demo-forest/leaves.log
+.DS_Store
+Thumbs.db

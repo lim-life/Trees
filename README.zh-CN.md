@@ -1,0 +1,392 @@
+> 🌏 [English](README.md)
+
+# 🌳 Trees
+
+> 类人脑的经验生态 —— 举一反三，播种种子，浇水成树，树自结果。
+
+项目有完整档案，经验可以单独复用。留下的种子会生长、互补、合成，长期用不到的就先休眠。
+
+`零依赖` · `本地优先` · `纯文件存储` · `框架无关` · `MIT`
+
+---
+
+## 为什么做这个
+
+那天正在和 AI 聊项目，聊到一半，屏幕上突然跳出一行红字：上下文最多只能装 1,048,576 tokens，我这次发出去的是 1,049,359，就多了 783 个。整个会话当场废掉，前面聊的也全没了。
+
+平时其实也差不多，只是没这么突然。每开一个会话，背景得重新交代，踩过的坑还会再踩，好不容易摸索出来的经验，会话一关就带不走。为了留住这些东西，我只能往上下文里继续塞，最后就塞到了上限。
+
+我想给这些经验找个能留下来的地方，于是做了 Trees。
+
+## 核心机制：用够了再抽象
+
+SkillEvolBench 等研究发现，从经验里蒸馏出的技能，效果常常还不如直接使用原始轨迹。我的理解是，蒸馏容易留下做法，却把当时为什么这么做、什么情况下才适用给省掉了。经验还没用上几次，就急着总结成通用规则，很多重要细节也就跟着丢了。
+
+所以 Trees 先把具体经验留下来，后面的事慢慢做：
+
+```
+现有做法（过早抽象）   项目完成 → 立刻蒸馏成技能        ← 丢上下文
+Trees（按需抽象）      项目完成 → 播种，保持具体
+                      → 浇水（复用）攒够证据
+                      → 才合成高级种子 = 模式         ← 归纳，不是猜测
+```
+
+说白了，浇水就是在数复用证据。`buried → sprouting → growing → advanced` 这套状态机，负责让抽象晚一点发生。
+
+要让这个思路成立，下面三条得一起守住：
+
+| 约束 | 含义 |
+|---|---|
+| 抽象延迟 | 种子生来是具体经验，不会自己变成模式；只有复用次数攒够了，或者参与了合成，才会升级 |
+| 互补才合成 | 合成看的是互补，不是相似。而且互补分强弱，见下。只共享 1 个标签的低关联种子只做标记，不合成 |
+| 原件不删 | 合成后原种子照样保留，标上 `synthesized_into`，随时可以拆回去 |
+
+判断互补要看两面:**交集**(两边重合多少)和**并集**(合起来覆盖多广)。
+重合多说明是同一件事,覆盖变宽才是真的更完整 —— 只看一面都会误判。
+
+| 成色 | 意思 | 该怎么办 |
+|---|---|---|
+| 串联 | 一颗是另一颗的前置，先 A 才能 B | 必须绑在一起 |
+| 强互补 | 各补一块，一方不灵的地方正是另一方的主场，合起来更完整 | 值得合成 |
+| 部分互补 | 有补充，但不是新维度，合起来只强一点 | 可以合，收益一般 |
+| 等价 | 两边说的是同一件事，合起来不增加信息 | 没必要合 |
+| 互斥 | 同一个情境，却给了相反的做法 | 绝对别合，先搞清谁对 |
+
+如果只有后面的那颗、前置还没出现，它就挂在那儿等 —— `trees waiting` 能看见谁在等什么，
+等那东西真被播种进来时，`trees new` 会提示「这颗可能正是别人在等的」。
+
+`trees candidates` 会把几种分开列出来，互斥的直接拒绝合成。
+判定逻辑在 `synthesize.js`：先排掉互斥和等价，再认强互补。
+
+## 用起来是这么转的
+
+```
+项目做完 → 播种 → 埋土
+                    ↓
+下次做项目 → 情境匹配 → 浇水(用了 + 验证通过) → 生长
+                    ↓
+        同情境浇够 5 次，且强互补 → 合成高级种子(人审)
+                    ↓
+              长期没浇(6 个月) → 入盒休眠
+```
+
+一个项目做完就播一次种。下次碰到对得上号的情境，种子被捞出来用；用上了并且验证通过，才算浇了一次水。同一类情境反复用够次数，又碰上互补的伙伴，才有资格合成为更高级的种子。长期用不上的，先收进盒子，等哪天需要了再召唤回来。
+
+## 概念
+
+项目里用了几个名字，含义和存放位置都在这里：
+
+| 元素 | 含义 | 存哪 |
+|---|---|---|
+| 大树 Tree | 一个项目的完整档案，可以整体复用 | `forest/trees/<id>.md` |
+| 种子 Seed | 项目产出的可复用经验，是最小单元 | `forest/seeds/<id>.md` |
+| 落叶 Leaf | 没有复用价值的杂事，只记一行日志，不进库 | `forest/leaves.log` |
+| 盒子 Box | 长期没用的种子（休眠，可以召唤回来） | `forest/box/<id>.md` |
+| 森林 Forest | 强关联的项目树群（`forest_id` 指向父树） | 写在 tree 里 |
+| 分支 Branch | 树上多个 AI 的贡献区，用来积累 AI 能力画像 | 写在 tree 里 |
+
+总不能什么杂事都往库里放。要不要留成种子，我只问一句：这次有没有产生下次还能用的判断？有就留下，没有就记成落叶。
+
+## 快速开始
+
+需要 Node.js ≥ 20，没有依赖要装。
+
+```bash
+git clone https://github.com/lim-life/Trees.git
+cd Trees/tools
+
+node bin/cli.js help        # 看命令
+node tests/run.mjs          # 跑自测（120 项）
+```
+
+想先翻翻现成的数据，仓库里有一个样例森林。里面的 4 颗种子，都是做 Trees 时自己踩过的坑：
+
+```bash
+TREES_HOME=../examples/demo-forest node bin/cli.js status
+TREES_HOME=../examples/demo-forest node bin/cli.js tree trees-oss
+TREES_HOME=../examples/demo-forest node bin/cli.js show seed-0003
+```
+
+Windows PowerShell 下用 `$env:TREES_HOME="..\examples\demo-forest"; node bin/cli.js status`。
+
+也可以从自己的一颗种子开始：
+
+```bash
+node bin/cli.js new "MSYS 里要用 /dev/null 而不是 NUL" --labels Windows,bash
+node bin/cli.js ls
+node bin/cli.js water seed-0001
+node bin/cli.js status
+```
+
+要在全局使用 `trees` 命令：
+
+```bash
+cd Trees/tools && npm link
+trees status
+```
+
+数据默认放在 `./forest`，想换位置就设蒸馏（按需蒸馏 —— 这个项目的核心）
+  trees candidates                 扫全库，找出互补的种子对
+  trees synthesize <a> <b>         把两颗互补的种子蒸馏成一颗高级种子
+  trees unsynthesize <id>          拆回原件（原件一直都在，合成从不删东西）
+  trees waiting                    列出正在等前置的种子
+  trees need <id> --for "<前置>"    登记前置（种子 id 或还没出现的描述）
+
+环境变量：
+
+```bash
+TREES_HOME=/path/to/my-forest trees status
+```
+
+## 文件长什么样
+
+数据都存在能直接读的 Markdown 里，可以用 git 管，拷到别处照样用，也不用搬数据库。
+
+一颗种子是这样的：
+
+```markdown
+---
+id: "seed-0001"
+title: "MSYS 路径要用 /dev/null 而不是 NUL"
+labels: ["Windows", "bash", "路径"]
+state: "growing"
+prev_state: null
+watered: 3
+failed: 0
+born: "2026-10-16"
+last_watered: "2026-10-16"
+from_tree: "radar"
+from_branch: "claude-opus-5-5"
+origin: "native"
+confidence: 1
+bloodline: []
+synthesized_into: null
+evidence: ""
+---
+## 判据
+在 MSYS/Git Bash 里写路径时用。
+
+## 做法
+用 `/dev/null`，不要用 Windows 的 `NUL`。
+
+## 不适用
+原生 PowerShell / cmd 环境 —— 那里 `NUL` 才对。
+```
+
+正文分成判据、做法、不适用三段。我最在意的是最后那段：总结经验时很容易把适用边界省掉，结果做法记住了，换个环境照着用，又踩一次坑。
+
+一棵树是这样的：
+
+```markdown
+---
+id: "radar"
+title: "手与剑居家雷达"
+type: "工业设计"
+created: "2026-09-20"
+updated: "2026-10-16"
+forest_id: null
+root_path: "F:/项目/双手雷达PPT"
+branches:
+  - branch_id: "design"
+    model: "claude-opus-5-5"
+    role: "设计规范"
+    outcome: "good"
+    seeds_planted: ["seed-0012"]
+seeds: ["seed-0001"]
+---
+## 项目做了什么
+## 关键决策
+## 复用说明
+```
+
+## 命令行
+
+```
+种子
+  trees new "<标题>" [--labels a,b] [--from <文件.md>] [--needs "<前置>"]   手动播种一颗种子
+  trees plant <项目路径>           从做完的项目里提取种子（要配模型）
+  trees plant <路径> --dry-run     只看看会提出什么，不落盘
+  trees ls [--state <状态>]        列出种子
+  trees show <seed-id>             看种子详情
+  trees water <seed-id> [--fail]   浇水（成功 +1 并推进状态；--fail 记失败且不推进）
+  trees find <关键词>              按标题 / 标签 / 正文检索
+  trees box <seed-id>              入盒（休眠）
+  trees summon <seed-id>           召唤出盒
+
+大树 / 森林
+  trees trees                      列出所有大树
+  trees tree <tree-id>             看一棵树（含挂在它下面的种子）
+  trees forest <子树> --under <父树>   建强关联（自动防环）
+
+黑夜循环（系统自跑）
+  trees dream [seed-id...]         今晚该学哪几颗（只出计划，不花钱）
+  trees dream --run                真去学（要配模型）
+  trees dream --config             看现在配的是哪个模型
+  trees grow                       看自然生长装没装
+  trees grow --show                只打印它会往你电脑上写什么，不动系统
+  trees grow --install [--at HH:MM] 装上（默认 03:17）
+  trees grow --uninstall           卸掉
+  trees config [--from-env]        把模型配置存下来（定时任务读的是这份）
+
+环境
+  trees init [--dry-run]           初始化数据目录（幂等）
+  trees status                     总览 + AI 能力画像
+```
+
+`trees status` 也会根据已有数据算一张 AI 能力画像：
+
+```
+AI 能力画像 (越用越准 → 直接喂给派单决策)
+   claude-opus-5-5        出种   8   成活率 100%
+   gemini-3.8-flash       出种  12   成活率  60%
+```
+
+每颗种子的 `from_branch` 都记着它由哪个 AI 产出。等数据攒起来，给模型派活时就能翻翻这些记录，看看谁留下的经验更经得住复用，不必全凭印象。用得越多，这张画像也会越准。
+
+## 状态机
+
+```
+buried ──浇水1次──▶ sprouting ──浇水≥2──▶ growing ──浇水≥5 或 被合成──▶ advanced
+  ▲                                                                      │
+  └──────────── 任意状态 ──180 天未浇水──▶ boxed ──被召唤──▶ 回到 prev_state ──┘
+```
+
+状态变化只看 `watered` 的次数，以及距 `last_watered` 过了多久。时间从上次使用算起，`born` 不参与。
+
+`failed` 也不参与状态计算。失败会记下来，作为判断种子质量的证据，但不会让种子降级。入盒同样按 `last_watered` 算：种得再早，只要一直有人用，就该留在库里。
+
+## 让它在夜里自己学
+
+挑谁由系统定：闲置 30~150 天的种子，用得越少越优先，一晚最多 5 颗、每颗最多 4000 token。
+
+**用哪个模型由你配** —— 每个人用自己的 key，谁也不占谁的便宜：
+
+```bash
+export TREES_LLM_BASE_URL=https://api.deepseek.com/v1
+export TREES_LLM_API_KEY=sk-...
+export TREES_LLM_MODEL=deepseek-chat
+
+trees dream          # 先看今晚打算学哪几颗
+trees dream --run    # 真去学
+```
+
+只要接口是 OpenAI 兼容的都能用。学习这活不需要贵模型，手头最便宜的那个就行。
+
+**学习不算浇水。** 夜里学到的只是见识 —— `evidence` 和正文会被补充，
+但 `watered`、`state`、`last_watered` 一个都不动。资历只能靠真用过。
+
+## 自然生长
+
+觉得手动跑麻烦，可以让它自己长 —— 每天在你不用电脑的时段学一会儿：
+
+```bash
+trees config --from-env    # 先把模型配置存下来（定时任务读的是这份，不是你的 export）
+trees grow --show          # 先看看它会往你电脑上写什么 —— 什么都不会动
+trees grow --install       # 真装（默认 03:17，可用 --at 改）
+trees grow                 # 看装没装、上次跑了什么
+trees grow --uninstall     # 卸掉
+```
+
+装的东西就两样：一个包装脚本（`~/.trees/grow.*`），和一条每天定点的计划任务
+（Windows 用计划任务，macOS / Linux 用 crontab）。日志在 `~/.trees/grow.log`。
+
+**装之前先跑 `--show`。** 它会一字不差地打给你看要写什么文件、注册什么命令 —— 一个按钮都不按。
+
+## 三种起步方式
+
+可以边做项目边积累，也可以从旧资料或别人的种子包开始：
+
+| 起点 | 怎么用 |
+|---|---|
+| 空手开局 | 直接做项目，做完自然播种。空库不会报错，只给一句友好的提示 |
+| 批量提取 | `trees plant <路径>`，从做完的项目或笔记里提取种子 |
+| 种子包导入 | `trees import <包.zip>`，站在别人的肩膀上。导入的种子 `confidence` 初始为 0.5，验证 3 次后升满 |
+
+种子包导入（`trees import`）还在计划里；批量提取已经能用了。
+
+## 框架无关
+
+核心只处理逻辑和文件，不依赖 AI 框架。不同环境通过适配器接入，目前做完的只有 CLI：
+
+| 接入 | 给谁用 | 状态 |
+|---|---|---|
+| CLI | Codex CLI / Gemini CLI / 任何能跑 shell 的 | 已可用 |
+| MCP 服务器 | Claude Code / Cursor / Cline / Windsurf / Zed… | 未实现 |
+| Skill 文件 | Claude Code | 未实现 |
+| standalone | 自带 LLM、一个框架都不用的人 | 未实现 |
+
+## 现在能跑什么，还欠什么
+
+前面说了不少打算，实际写完的范围也得交代清楚。
+
+核心数据层已经完成，120 项自测全部通过：
+
+- `frontmatter.js`：零依赖的 YAML 解析和序列化，能正确处理中文、冒号、引号和对象数组
+- `seed.js`：种子模型，包含状态机、浇水、失败记录、入盒与召唤、id 分配，以及空库时的友好处理
+- `tree.js`：大树模型，包含分支、挂载种子和复用说明
+- `forest.js`：森林关系，树群之间会自动防环
+- `leaves.js`：落叶日志
+- `synthesize.js`：互补判定 + 合成 + 血统 + 回拆
+- `dream.js`：黑夜循环 —— 挑该学的种子、守预算、真去学（只补见识，不涨资历）
+- `plant.js`：从做完的项目里提取种子，自动区分落叶
+- `bin/cli.js`：前面命令表里的全部命令
+
+需要接 LLM 的部分还没做：
+
+- `health`：健康检查
+- MCP、Skill、standalone 三种适配器
+
+## 路线图
+
+1. v0.1：核心数据层 + CLI（已完成）
+2. v0.2：`plant` / `synthesize` —— 今天能跑通「项目 → 种子 → 合成」全链路（已完成）
+3. v0.3：MCP 适配器，让 Claude Code 和 Cursor 直接接入
+4. v0.4：黑夜循环。挑种与预算已完成，接入模型那一步待做
+5. v1.0：种子包导入导出，AI 能力画像正式接入派单
+
+## 铁律
+
+1. 落叶不进库，免得杂事淹没有用的经验。
+2. 空库不报错，从零开始也得能正常用。
+3. 合成要人审，抽象时丢掉的细节没法凭空还原。
+4. 原件不删，合成随时可以拆回去。
+5. 导入的种子降权，别人的经验先留个问号。
+6. 黑夜循环限预算，不能自动烧钱。
+7. 部署要幂等、有备份、可卸载，别给使用的人添麻烦。
+
+## 成长预期
+
+```
+0–10 颗种子      几乎没感觉 —— 别急着下结论
+10–50 颗        开始偶尔命中
+50–200 颗       明显省事，同类项目快一半
+200+ 颗         真正的举一反三
+```
+
+## 学术背景
+
+把经验固化成可复用的做法，学术上叫 episodic → procedural memory consolidation，也就是情景记忆向程序性记忆的固化。隔离式记忆和本地存储已经有 Mem0、Letta、Cognee 这些成熟工作；从重复经验里整理出结构化的 know-how，还没有稳定方案，仍然是研究前沿。有篇论文直接写道：“没有任何先前工作形式化了程序性记忆的固化。”
+
+我在 Trees 里想验证的是：先保留具体经验，真正用上几次，攒够证据，再试着抽象。这样总结出来的模式，至少有实际复用作依据，能更接近归纳。
+
+这事儿能不能成立，光我自己用还不够，得有更多人来试。所以把它开源了。
+
+---
+
+## 参与
+
+可以通过 `zzx060427@outlook.com` 联系我，也欢迎直接开 [issue](https://github.com/lim-life/Trees/issues)。
+
+项目还早，现在最缺的是有人把它用到自己的活里，碰到问题再告诉我。
+
+发现 bug 或有新想法，都欢迎提。如果已经用了一阵子，我尤其想知道：留下的种子，你后来真的复用过吗？核心假设只能靠这件事来验证。
+
+反馈时方便的话，带上这些：
+
+1. 使用的版本和系统
+2. `node tests/run.mjs` 的输出（自测挂了就贴这个）
+3. 你期望发生什么，实际发生了什么
+
+## License
+
+MIT © 2026 张子翔
