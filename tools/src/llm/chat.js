@@ -62,6 +62,54 @@ export async function loadLlmConfig(env = process.env) {
  *          config?:object, env?:object, fetchImpl?:Function}} opts
  * @returns {Promise<{text:string, usage:object|null, model:string}>}
  */
+/** 把 SSE 数据流读成完整文本，并记录结束标记 finish_reason。 */
+async function readSse(res, fallbackModel) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let text = '';
+  let finish = null;
+  let usage = null;
+  let model = fallbackModel;
+
+  const consume = (line) => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) return;
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === '[DONE]') return;
+    let obj;
+    try { obj = JSON.parse(payload); } catch { return; }
+    if (obj.model) model = obj.model;
+    if (obj.usage) usage = obj.usage;
+    const choice = (obj.choices || [])[0];
+    if (!choice) return;
+    if (typeof choice.delta?.content === 'string') text += choice.delta.content;
+    if (choice.finish_reason) finish = choice.finish_reason;
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf('\n')) >= 0) {
+      consume(buffer.slice(0, idx));
+      buffer = buffer.slice(idx + 1);
+    }
+  }
+  buffer += decoder.decode();
+  if (buffer) consume(buffer);
+  return { text, finish, usage, model };
+}
+
+/**
+ * 发一次对话请求。默认走流式，并校验结束标记 ——
+ * 非流式长请求很容易被中转站掐断，收到半截却不知道（见种子 seed-0004）。
+ *
+ * @param {{messages:Array<{role:string,content:string}>, maxTokens?:number,
+ *          config?:object, env?:object, fetchImpl?:Function, stream?:boolean}} opts
+ * @returns {Promise<{text:string, usage:object|null, model:string}>}
+ */
 export async function chat(opts) {
   const cfg = opts.config ?? await loadLlmConfig(opts.env);
   if (!cfg) {
@@ -77,11 +125,11 @@ export async function chat(opts) {
     throw new Error('当前 Node 没有全局 fetch，需要 Node >= 18');
   }
 
+  const stream = opts.stream !== false;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
-  let res;
   try {
-    res = await doFetch(`${cfg.baseUrl}/chat/completions`, {
+    const res = await doFetch(`${cfg.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -91,25 +139,41 @@ export async function chat(opts) {
         model: cfg.model,
         messages: opts.messages,
         max_tokens: opts.maxTokens ?? 4000,
+        stream,
+        ...(stream ? { stream_options: { include_usage: true } } : {}),
       }),
       signal: controller.signal,
     });
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`模型接口返回 ${res.status}：${body.slice(0, 300)}`);
+    }
+
+    if (!stream || !res.body) {
+      const data = await res.json();
+      const choice = (data.choices || [])[0] || {};
+      if (choice.finish_reason === 'length') {
+        throw new Error('模型输出被截断（finish_reason=length）—— 调大 maxTokens 或把任务拆小');
+      }
+      return {
+        text: choice.message?.content ?? '',
+        usage: data.usage ?? null,
+        model: data.model ?? cfg.model,
+      };
+    }
+
+    const out = await readSse(res, cfg.model);
+    if (out.finish === 'length') {
+      throw new Error('模型输出被截断（finish_reason=length）—— 调大 maxTokens 或把任务拆小');
+    }
+    if (!out.finish) {
+      throw new Error('流式响应没有结束标记（finish_reason）—— 连接可能被中转站掐断，请重试');
+    }
+    return { text: out.text, usage: out.usage, model: out.model };
   } finally {
     clearTimeout(timer);
   }
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`模型接口返回 ${res.status}：${body.slice(0, 300)}`);
-  }
-
-  const data = await res.json();
-  const choice = (data.choices || [])[0] || {};
-  return {
-    text: choice.message?.content ?? '',
-    usage: data.usage ?? null,
-    model: data.model ?? cfg.model,
-  };
 }
 
 /** 当前配置的摘要（给 `trees dream --config` 用，不打印 key）。 */

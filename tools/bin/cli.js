@@ -12,7 +12,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { ensureDirs, getForestRoot } from '../src/core/paths.js';
 import {
-  createSeed, readSeed, listSeeds, waterSeed, boxSeed, summonSeed,
+  createSeed, readSeed, listSeeds, waterSeed, boxSeed, summonSeed, sweepAging,
 } from '../src/core/seed.js';
 import { listTrees, readTree, getTreeSeeds, linkSeed } from '../src/core/tree.js';
 import { linkForest, getForestMembers } from '../src/core/forest.js';
@@ -25,6 +25,13 @@ import {
 } from '../src/core/dream.js';
 import { readConfig, writeConfig, configPath } from '../src/core/config.js';
 import { plantFrom } from '../src/core/plant.js';
+import { recall, renderRecall } from '../src/core/recall.js';
+import { renderIndex, writeIndex } from '../src/core/indexer.js';
+import { runAuto, readAutoLog, autoLogPath } from '../src/core/session.js';
+import {
+  finishProject, unfinishProject, plantBranch, recycleBranch, plantProject,
+  findLastKey, writeLastKey, resolveChain,
+} from '../src/core/project.js';
 import {
   buildGrowPlan, install as growInstall, uninstall as growUninstall,
   status as growStatus, DEFAULT_AT, TASK_NAME,
@@ -88,11 +95,14 @@ ${c.cyan}种子${c.reset}
   trees show <seed-id>             看种子详情
   trees water <seed-id> [--fail]   浇水（成功 +1 并推进状态；--fail 记失败且不推进）
   trees find <关键词>              按标题/标签/正文检索
+  trees recall "<任务描述>" [--limit N] [--budget N] [--all] [--json]
+                                   召回该带进上下文的种子（默认 5 颗 / 4000 token）
   trees box <seed-id>              入盒（休眠）
   trees summon <seed-id>           召唤出盒
+  trees sweep                      把 180 天没浇水的种子送进盒子
 
 ${c.cyan}大树 / 森林${c.reset}
-  trees trees                      列出所有大树
+  trees trees [--all]              列出所有大树（默认不看会话节点）
   trees tree <tree-id>             看一棵树（含挂在它下面的种子）
   trees forest <子树> --under <父树>   建强关联（自动防环）
 
@@ -103,7 +113,7 @@ ${c.cyan}蒸馏${c.reset} ${c.dim}（按需蒸馏 —— 这个项目的核心�
   trees waiting                    列出正在等前置的种子
   trees need <id> --for "<前置>"    登记前置（可以是种子 id，也可以是还没出现的描述）
 
-${c.cyan}黑夜循环${c.reset} ${c.dim}（系统自跑 —— 目前只出计划，不调模型）${c.reset}
+${c.cyan}黑夜循环${c.reset} ${c.dim}（系统自跑 —— 默认只出计划，--run 才调模型）${c.reset}
   trees dream [seed-id...]         今晚该学哪几颗（只出计划）
   trees dream --run                真去学（要配模型，会花钱）
   trees dream --config             看现在配的是哪个模型
@@ -119,7 +129,24 @@ ${c.cyan}自然生长${c.reset} ${c.dim}（让它在你不用的时段自己长�
   trees grow --uninstall           卸掉
   trees config [--from-env]        配模型（定时任务读的是这份，不是你的 export）
 
-${c.cyan}环境${c.reset}
+${c.cyan}项目链${c.reset} ${c.dim}（会话树 → 项目大树 → 首次播种）${c.reset}
+  trees tip                        看当前接续点、上次会话和未完成事项
+  trees use <s-XXXXXXXX>           回档 / 切换接续点
+  trees finish <s-XXXXXXXX>        合并会话链并首次播种（--force 跳过完成判断）
+  trees unfinish <proj-id>         拆回项目树
+  trees plant-branch <s-XXXXXXXX>  把旁支单独播种
+  trees recycle <s-XXXXXXXX>       旁支回收（休眠）
+  trees plant-project <proj-id>    重新播种一个项目
+
+${c.cyan}会话回写${c.reset} ${c.dim}（会话结束只记录，不播种；默认关闭）${c.reset}
+  trees auto --enable / --disable  开关自动回写
+  trees auto --finish / --no-finish 开关项目完成时自动合并
+  trees auto --status              看开关、模型和最近日志
+  trees auto --transcript <会话.jsonl> [--dry-run]   手动跑一次
+
+${c.cyan}索引 / 环境${c.reset}
+  trees index                      生成 forest/index.md（几 KB 的目录，给新会话注入）
+  trees index --print [--if-any]   只打印不落盘；--if-any 空库时什么都不输出
   trees init [--dry-run]           初始化数据目录（幂等）
   trees status                     总览
 
@@ -137,12 +164,12 @@ function emptyHint() {
 
 async function cmdInit() {
   const dry = hasFlag('--dry-run');
-  const existed = await ensureDirs();
   console.log(`数据根：${getForestRoot()}`);
   if (dry) {
-    console.log(`${c.dim}(--dry-run) 目录已检查，未做修改。${c.reset}`);
+    console.log(`${c.dim}(--dry-run) 未写入任何文件。${c.reset}`);
     return;
   }
+  const existed = await ensureDirs();
   console.log(existed ? '✅ 目录结构已就绪' : '✅ 目录结构已创建');
 }
 
@@ -247,6 +274,50 @@ async function cmdFind() {
   for (const s of hit) console.log(seedLine(s));
 }
 
+async function cmdRecall() {
+  const query = (() => {
+    const words = [];
+    for (const a of args) {
+      if (a.startsWith('-')) break;
+      words.push(a);
+    }
+    return words.join(' ').trim();
+  })();
+  if (!query) {
+    return err('用法：trees recall "<任务描述>" [--limit N] [--budget N] [--all] [--json]');
+  }
+
+  const limit = Number(valueOf('--limit')) || undefined;
+  const budget = Number(valueOf('--budget')) || undefined;
+  const result = await recall(query, {
+    limit,
+    budget,
+    includeBoxed: hasFlag('--all'),
+  });
+
+  if (hasFlag('--json')) {
+    console.log(JSON.stringify({
+      query: result.query,
+      tokens: result.tokens,
+      budget: result.budget,
+      picks: result.picks.map((p) => ({
+        id: p.seed.id,
+        title: p.seed.title,
+        score: Number(p.score.toFixed(3)),
+        labels: p.seed.labels,
+        state: p.seed.state,
+        watered: p.seed.watered,
+        tokens: p.tokens,
+        text: p.text,
+      })),
+      divergent: result.divergent,
+    }, null, 2));
+    return;
+  }
+
+  console.log(renderRecall(result));
+}
+
 async function cmdBox() {
   const id = plainArgs[0];
   if (!id) return err('用法：trees box <seed-id>');
@@ -261,6 +332,212 @@ async function cmdSummon() {
   const s = await summonSeed(id);
   if (!s) return err(`找不到种子：${id}`);
   console.log(`✨ ${s.id} 已召唤出盒，恢复为 ${c.green}${s.state}${c.reset}`);
+}
+
+/** 一次性把 stdin 读完（hook 会把 JSON 从标准输入递进来）。 */
+async function readStdin() {
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+async function cmdAuto() {
+  if (hasFlag('--finish') || hasFlag('--no-finish')) {
+    await writeConfig({ autoFinish: hasFlag('--finish') });
+    console.log(hasFlag('--finish') ? '✅ 项目完成时自动合并并播种已开启' : '🍂 自动合并已关闭（只记录会话节点）');
+    return;
+  }
+  if (hasFlag('--enable')) {
+    await writeConfig({ autoPlant: true });
+    console.log('✅ 会话结束自动回写已开启');
+    console.log(`${c.dim}   只记录会话节点，不播种；项目完成时才合并并提取种子。${c.reset}`);
+    return;
+  }
+  if (hasFlag('--disable')) {
+    await writeConfig({ autoPlant: false });
+    console.log('🍂 会话结束自动回写已关闭');
+    return;
+  }
+  if (hasFlag('--status')) {
+    const cfg = await readConfig();
+    const { describeConfig } = await import('../src/llm/chat.js');
+    const llm = await describeConfig();
+    console.log(`会话回写  ${cfg.autoPlant === true ? c.green + '已开启' + c.reset : c.dim + '关闭' + c.reset}`);
+    console.log(`自动合并  ${cfg.autoFinish === true ? c.green + '已开启' + c.reset : c.dim + '关闭' + c.reset}`);
+    console.log(`   模型    ${llm.configured ? llm.model : c.red + '未配置（回写会跳过）' + c.reset}`);
+    const tail = await readAutoLog(5);
+    if (tail) {
+      console.log(`${c.dim}   最近日志（${autoLogPath()}）：${c.reset}`);
+      for (const line of tail.split('\n')) console.log(`     ${c.dim}${line}${c.reset}`);
+    }
+    return;
+  }
+
+  let transcript = valueOf('--transcript');
+  let cwd = valueOf('--cwd');
+
+  if (hasFlag('--hook')) {
+    // Claude Code 的 SessionEnd hook 从 stdin 递 JSON
+    try {
+      const payload = JSON.parse(await readStdin());
+      transcript = payload.transcript_path || transcript;
+      cwd = payload.cwd || cwd;
+    } catch { /* stdin 不是 JSON 就按参数来 */ }
+  }
+
+  if (!transcript && !hasFlag('--hook')) {
+    return err('用法：trees auto --transcript <会话.jsonl> [--dry-run] | trees auto --enable | --status');
+  }
+
+  const result = await runAuto({
+    transcript,
+    cwd,
+    fromKey: valueOf('--from'),
+    dryRun: hasFlag('--dry-run'),
+    force: hasFlag('--force'),
+  });
+
+  if (result.skipped) {
+    console.log(`${c.dim}跳过：${result.skipped}${c.reset}`);
+    return;
+  }
+  if (result.dryRun) {
+    console.log(`📝 [dry-run] 会记录会话 ${result.key}（${result.projectStatus}），不落盘`);
+    return;
+  }
+  console.log(`📝 会话节点 ${result.key} · ${result.projectStatus}${result.openThreads?.length ? ` · 未完成 ${result.openThreads.length} 项` : ''}`);
+  if (result.mergedInto) {
+    console.log(`🌳 项目完成，已合并为 ${result.mergedInto} 并首次播种`);
+  } else if (result.finish?.ready) {
+    console.log(`${c.yellow}🪵 项目看起来完成了 —— trees finish ${result.key}${c.reset}`);
+  }
+  console.log(`${c.dim}   会话树只记录原料；项目完成后才播种。${c.reset}`);
+}
+
+async function cmdTip() {
+  const key = valueOf('--key') || await findLastKey(process.cwd());
+  if (!key) {
+    if (hasFlag('--verbose')) console.log('没有找到接续点（.trees/last-key）。');
+    return;
+  }
+  try {
+    const chain = await resolveChain(key);
+    const tip = chain[chain.length - 1];
+    console.log('## Trees 当前项目');
+    console.log(`上次会话：${tip.id}（${tip.title}）`);
+    console.log(`状态：${tip.project_status}${tip.status_reason ? ` — ${tip.status_reason}` : ''}`);
+    if ((tip.open_threads || []).length) console.log(`未完成：${tip.open_threads.join('；')}`);
+    console.log(`链长：${chain.length}（${chain.map((t) => t.id).join(' → ')}）`);
+    console.log('接续：默认自动；回档：trees use <更早的钥匙>');
+  } catch (e) {
+    if (hasFlag('--verbose')) err(e.message);
+  }
+}
+
+async function cmdUse() {
+  const key = plainArgs[0];
+  if (!key) return err('用法：trees use <s-XXXXXXXX>');
+  const tree = await readTree(key);
+  if (!tree || tree.kind !== 'session') return err(`找不到会话：${key}`);
+  await writeLastKey(process.cwd(), key);
+  console.log(`🔑 接续点已切到 ${key}（${tree.title}）`);
+}
+
+async function cmdFinish() {
+  const key = plainArgs[0];
+  if (!key) return err('用法：trees finish <s-XXXXXXXX> [--id <项目id>] [--title <标题>] [--force]');
+  const cfg = await readConfig();
+  try {
+    const project = await finishProject(key, {
+      id: valueOf('--id'),
+      title: valueOf('--title'),
+      fromBranch: cfg.model || '',
+      allowIncomplete: hasFlag('--force'),
+    });
+    console.log(`🌳 项目大树 ${c.green}${project.id}${c.reset}  ${project.title}`);
+    console.log(`   合并 ${project.chain.length} 个会话：${project.chain.join(' → ')}`);
+    if (project.plantError) {
+      console.log(`${c.yellow}   播种失败：${project.plantError}${c.reset}`);
+      console.log(`${c.dim}   重试：trees plant-project ${project.id}${c.reset}`);
+    } else {
+      console.log(`   🌰 首次播种 ${project.seeds} 颗，${project.leaves} 条落叶`);
+    }
+  } catch (e) {
+    err(e.message);
+  }
+}
+
+async function cmdUnfinish() {
+  const id = plainArgs[0];
+  if (!id) return err('用法：trees unfinish <proj-id>');
+  try {
+    const r = await unfinishProject(id);
+    console.log(`↩️  ${id} 已拆回，恢复 ${r.restored.length} 个会话`);
+    if (r.seeds) console.log(`   ${r.seeds} 颗种子保留，已挂回最后一个会话`);
+  } catch (e) {
+    err(e.message);
+  }
+}
+
+async function cmdPlantBranch() {
+  const key = plainArgs[0];
+  if (!key) return err('用法：trees plant-branch <s-XXXXXXXX>');
+  const cfg = await readConfig();
+  try {
+    const r = await plantBranch(key, { fromBranch: cfg.model || '' });
+    console.log(`🌿 旁支树 ${c.green}${r.id}${c.reset}  ${r.title}`);
+    if (r.plantError) console.log(`${c.yellow}   播种失败：${r.plantError}${c.reset}`);
+    else console.log(`   🌰 播种 ${r.seeds} 颗`);
+  } catch (e) {
+    err(e.message);
+  }
+}
+
+async function cmdRecycle() {
+  const key = plainArgs[0];
+  if (!key) return err('用法：trees recycle <s-XXXXXXXX>');
+  try {
+    const s = await recycleBranch(key);
+    console.log(`📦 ${s.id} 已当枯树回收（休眠，原件保留）`);
+  } catch (e) {
+    err(e.message);
+  }
+}
+
+async function cmdPlantProject() {
+  const id = plainArgs[0];
+  if (!id) return err('用法：trees plant-project <proj-id>');
+  const cfg = await readConfig();
+  try {
+    const r = await plantProject(id, { fromBranch: cfg.model || '' });
+    console.log(`🌰 ${id} 播种 ${r.seeds} 颗，${r.leaves} 条落叶`);
+  } catch (e) {
+    err(e.message);
+  }
+}
+
+async function cmdIndex() {
+  if (hasFlag('--print')) {
+    const result = await renderIndex({ maxSeeds: Number(valueOf('--max')) || undefined });
+    if (hasFlag('--if-any') && result.totalSeeds === 0) return;
+    console.log(result.text);
+    return;
+  }
+  const result = await writeIndex({ maxSeeds: Number(valueOf('--max')) || undefined });
+  console.log(`🗂  ${result.path}`);
+  console.log(`   ${result.active} 颗活跃 / ${result.boxed} 颗休眠 / ${result.trees} 棵大树`);
+}
+
+async function cmdSweep() {
+  const boxed = await sweepAging();
+  if (!boxed.length) {
+    console.log('没有需要入盒的种子。');
+    return;
+  }
+  console.log(`📦 ${boxed.length} 颗种子长期没浇水，已入盒：`);
+  for (const s of boxed) {
+    console.log(`  ${s.id}  ${s.title}  ${c.dim}入盒前 ${s.prev_state} / 末次浇水 ${s.last_watered}${c.reset}`);
+  }
 }
 
 async function cmdCandidates() {
@@ -558,9 +835,12 @@ async function cmdGrow() {
 }
 
 async function cmdTrees() {
-  const all = await listTrees();
+  const every = await listTrees();
+  // 会话节点是原料，默认不混在项目列表里；--all 才显示
+  const all = hasFlag('--all') ? every : every.filter((t) => t.kind !== 'session');
   if (!all.length) {
     console.log('🌳 还没有大树 —— 做完一个项目就会长出一棵。');
+    if (every.length) console.log(`${c.dim}   （另有 ${every.length} 个未完成的会话节点，trees trees --all 查看）${c.reset}`);
     return;
   }
   console.log(`${all.length} 棵大树：`);
@@ -608,7 +888,7 @@ async function cmdForest() {
 
 async function cmdStatus() {
   const seeds = await listSeeds({});
-  const trees = await listTrees();
+  const trees = (await listTrees()).filter((t) => t.kind !== 'session');
   console.log(`🌳 大树 ${trees.length} 棵     🌰 种子 ${seeds.length} 颗`);
   if (!seeds.length) {
     if (!trees.length) return emptyHint();
@@ -659,16 +939,18 @@ async function main() {
     return;
   }
 
-  // 除了纯帮助类，都先把目录准备好（幂等）—— 空库也不能报错
-  await ensureDirs();
+  // 除 init 自己处理 --dry-run 外，都先把目录准备好（幂等）—— 空库也不能报错
+  if (cmd !== 'init') await ensureDirs();
 
   const table = {
     init: cmdInit, new: cmdNew, ls: cmdLs, list: cmdLs, show: cmdShow, water: cmdWater,
-    find: cmdFind, box: cmdBox, summon: cmdSummon,
+    find: cmdFind, recall: cmdRecall, box: cmdBox, summon: cmdSummon, sweep: cmdSweep,
     trees: cmdTrees, tree: cmdTree, forest: cmdForest, status: cmdStatus,
     candidates: cmdCandidates, synthesize: cmdSynthesize, unsynthesize: cmdUnsynthesize,
     waiting: cmdWaiting, need: cmdNeed, dream: cmdDream,
-    config: cmdConfig, grow: cmdGrow, plant: cmdPlant,
+    config: cmdConfig, grow: cmdGrow, plant: cmdPlant, index: cmdIndex, auto: cmdAuto,
+    tip: cmdTip, use: cmdUse, finish: cmdFinish, unfinish: cmdUnfinish,
+    'plant-branch': cmdPlantBranch, recycle: cmdRecycle, 'plant-project': cmdPlantProject,
   };
   const fn = table[cmd];
   if (!fn) {

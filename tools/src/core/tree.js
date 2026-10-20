@@ -37,7 +37,10 @@ import { readSeed, writeSeed } from './seed.js';
  * @property {string} body Markdown 正文，不写入 frontmatter。
  */
 
-const SECTIONS = ['项目做了什么', '关键决策', '复用说明'];
+const SECTIONS_BY_KIND = {
+  project: ['项目做了什么', '关键决策', '复用说明'],
+  session: ['本次做了什么', '关键决策', '下一步'],
+};
 const OUTCOMES = new Set(['good', 'mixed', 'bad']);
 const RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 
@@ -140,10 +143,10 @@ function normalizeBranch(branch) {
   return result;
 }
 
-function ensureSections(body) {
+function ensureSections(body, kind = 'project') {
   let result = stringField(body, 'body');
 
-  for (const section of SECTIONS) {
+  for (const section of SECTIONS_BY_KIND[kind] || SECTIONS_BY_KIND.project) {
     const heading = new RegExp(`^##[ \\t]+${section}[ \\t]*\\r?$`, 'm');
     if (!heading.test(result)) {
       result = `${result.trimEnd()}${result.trim() ? '\n\n' : ''}## ${section}\n`;
@@ -178,17 +181,37 @@ function normalizeTree(fields) {
 
   const date = today();
 
+  const continuesFrom = fields.continues_from ?? null;
+  if (continuesFrom !== null) assertId(continuesFrom);
+  const mergedInto = fields.merged_into ?? null;
+  if (mergedInto !== null) assertId(mergedInto);
+
+  const projectStatus = ['complete', 'ongoing', 'unknown'].includes(fields.project_status)
+    ? fields.project_status
+    : 'unknown';
+  const kind = fields.kind === 'session' ? 'session' : 'project';
+
   return {
     id: fields.id,
     title: stringField(fields.title, 'title'),
     type: stringField(fields.type, 'type'),
+    kind,
     created: dateField(fields.created, 'created', date),
     updated: dateField(fields.updated, 'updated', date),
     forest_id: forestId,
     root_path: stringField(fields.root_path, 'root_path'),
     branches: normalizedBranches,
     seeds: stringArray(fields.seeds, 'seeds'),
-    body: ensureSections(fields.body),
+    // 会话链：指向上一个会话；合并后 merged_into 指向项目树
+    continues_from: continuesFrom,
+    merged_into: mergedInto,
+    project_status: projectStatus,
+    status_reason: stringField(fields.status_reason, 'status_reason'),
+    open_threads: stringArray(fields.open_threads, 'open_threads'),
+    explicit_complete: fields.explicit_complete === true,
+    merged_sessions: stringArray(fields.merged_sessions, 'merged_sessions'),
+    dormant: fields.dormant === true,
+    body: ensureSections(fields.body, kind),
   };
 }
 
@@ -383,6 +406,21 @@ export async function linkSeed(treeId, seedId) {
       throw error;
     }
   });
+}
+
+/**
+ * 删除一棵树。只用于合成产物（项目树）——原件（会话树、种子）永不因合成被删除。
+ * @param {string} id
+ * @returns {Promise<boolean>} 删除成功返回 true
+ */
+export async function deleteTree(id) {
+  if (!isValidId(id)) return false;
+  try {
+    await unlink(path.join(getPath('trees'), `${id}.md`));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

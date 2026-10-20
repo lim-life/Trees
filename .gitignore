@@ -7,9 +7,12 @@ package-lock.json
 **/forest/trees/
 **/forest/box/
 **/forest/leaves.log
-**/forest/config.json   # 里面可能有你的 API key
+# 里面可能有你的 API key（行内注释会让整行失效，注释必须单独一行）
+**/forest/config.json
 
-# 临时文件
+# 项目目录里的接续点 / 临时
+**/.trees/
+.tmp/
 *.tmp
 *.log
 !examples/demo-forest/leaves.log

@@ -16,7 +16,7 @@
 import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { createSeed, listSeeds } from './seed.js';
-import { createTree, readTree, linkSeed } from './tree.js';
+import { createTree, readTree, linkSeed, addBranch } from './tree.js';
 
 /** 只读这些后缀的文件。 */
 const TEXT_EXT = new Set([
@@ -121,9 +121,20 @@ function plantPrompt(material, sourceName) {
     + '"seeds":[{"title":"一句话，要具体","labels":["情境标签"],'
     + '"criteria":"判据正文","method":"做法正文","notApplicable":"不适用正文",'
     + '"evidence":"原始证据指针：哪个文件或哪次对话"}],'
-    + '"leaves":["做了什么但没有复用价值的事"]}',
+    + '"leaves":["做了什么但没有复用价值的事"],'
+    + '"project_status":"ongoing|complete|unknown",'
+    + '"status_reason":"一句话依据",'
+    + '"open_threads":["还没做完的事"],'
+    + '"explicit_complete":false}',
     '',
     '`tree.id` 用能一眼认出的英文小写短横线名（比如 `hand-sword-radar`）。',
+    '',
+    '## 项目是否完成',
+    '- `project_status`: `complete` 仅当用户明确说完成/交付，或所有交付物都完成且没有未完成事项；',
+    '  `ongoing` 表示还有没做完的事；拿不准写 `unknown`。',
+    '- `open_threads`: 还没做完的具体事项。有一个就不算完成。',
+    '- `explicit_complete`: 用户是否明确说了完成/交付（true / false）。',
+    '- **会话结束本身不算完成** —— 可能只是没时间了、换任务了。',
     '',
     `## 材料（来源：${sourceName}）`,
     '',
@@ -154,7 +165,22 @@ function parsePlantOutput(text) {
       evidence: String(x.evidence || '').trim(),
     }));
 
-  return { tree, seeds: clean, leaves };
+  const projectStatus = ['complete', 'ongoing', 'unknown'].includes(obj.project_status)
+    ? obj.project_status
+    : 'unknown';
+  const openThreads = Array.isArray(obj.open_threads)
+    ? obj.open_threads.map(String).map((x) => x.trim()).filter(Boolean)
+    : [];
+
+  return {
+    tree,
+    seeds: clean,
+    leaves,
+    project_status: projectStatus,
+    status_reason: String(obj.status_reason || '').trim(),
+    open_threads: openThreads,
+    explicit_complete: obj.explicit_complete === true,
+  };
 }
 
 /** 把三段拼成种子正文。 */
@@ -216,27 +242,30 @@ function safeId(id, fallback) {
  *          fromBranch?:string, maxSeeds?:number}} opts
  * @returns {Promise<object>}
  */
-export async function plantFrom(opts) {
-  const collected = await collectMaterials(opts.path);
-  if (!collected.text.trim()) {
-    throw new Error(`这个路径里没找到可读的文本文件：${opts.path}`);
+export async function plantFromMaterial(opts) {
+  const material = String(opts.material || '');
+  if (!material.trim()) {
+    throw new Error('材料是空的，没有可提取的内容');
   }
 
+  const source = opts.source || '(材料)';
   const extracted = await extractSeeds({
-    material: collected.text,
-    source: opts.path,
+    material,
+    source,
     callModel: opts.callModel,
     maxSeeds: opts.maxSeeds,
   });
 
   const plan = {
-    source: opts.path,
-    filesRead: collected.files.length,
-    truncated: collected.truncated,
+    source,
     tree: extracted.tree,
     seeds: extracted.seeds,
     leaves: extracted.leaves,
     usage: extracted.usage,
+    project_status: extracted.project_status,
+    status_reason: extracted.status_reason,
+    open_threads: extracted.open_threads,
+    explicit_complete: extracted.explicit_complete,
     written: false,
   };
 
@@ -247,16 +276,26 @@ export async function plantFrom(opts) {
   const treeId = opts.treeId || safeId(extracted.tree?.id, fallbackId);
 
   const existing = await readTree(treeId);
-  if (existing) {
+  if (existing && !opts.allowExisting) {
     throw new Error(`大树 ${treeId} 已经存在了 —— 换个 id，或者用 --tree 指定另一棵`);
   }
 
-  await createTree({
+  const treeFields = {
     id: treeId,
-    title: extracted.tree?.title || path.basename(opts.path),
-    type: extracted.tree?.type || '',
-    root_path: opts.path,
-  });
+    title: opts.title || extracted.tree?.title || path.basename(source),
+    type: opts.treeType || extracted.tree?.type || '',
+    root_path: opts.rootPath || opts.path || source,
+    ...(opts.session === true ? {
+      kind: 'session',
+      continues_from: opts.continuesFrom ?? null,
+      project_status: extracted.project_status,
+      status_reason: extracted.status_reason,
+      open_threads: extracted.open_threads,
+      explicit_complete: extracted.explicit_complete,
+    } : {}),
+    ...(opts.treeFields || {}),
+  };
+  if (!existing) await createTree(treeFields);
 
   const created = [];
   for (const s of extracted.seeds) {
@@ -275,5 +314,31 @@ export async function plantFrom(opts) {
     created.push(seed);
   }
 
+  // 分支是 AI 能力画像的数据来源 —— 只知道是哪个模型播的种，也得记在树上
+  if (opts.fromBranch && created.length) {
+    await addBranch(treeId, {
+      model: opts.fromBranch,
+      role: '播种提取',
+      outcome: 'good',
+      seeds_planted: created.map((s) => s.id),
+    });
+  }
+
   return { ...plan, written: true, treeId, created };
+}
+
+/**
+ * 从目录/文件播种（收集材料后交给 plantFromMaterial）。
+ *
+ * @param {{path:string, callModel?:Function, dryRun?:boolean, treeId?:string,
+ *          fromBranch?:string, maxSeeds?:number}} opts
+ * @returns {Promise<object>}
+ */
+export async function plantFrom(opts) {
+  const collected = await collectMaterials(opts.path);
+  if (!collected.text.trim()) {
+    throw new Error(`这个路径里没找到可读的文本文件：${opts.path}`);
+  }
+  const result = await plantFromMaterial({ ...opts, material: collected.text, source: opts.path });
+  return { ...result, filesRead: collected.files.length, truncated: collected.truncated };
 }

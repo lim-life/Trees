@@ -61,16 +61,33 @@ Trees（按需抽象）      项目完成 → 播种，保持具体
 ## 用起来是这么转的
 
 ```
-项目做完 → 播种 → 埋土
-                    ↓
-下次做项目 → 情境匹配 → 浇水(用了 + 验证通过) → 生长
-                    ↓
-        同情境浇够 5 次，且强互补 → 合成高级种子(人审)
-                    ↓
-              长期没浇(6 个月) → 入盒休眠
+项目开始
+  │
+  ├─ 会话开始 → 注入库目录 + 当前项目的接续点
+  │    └─ 干活：recall 召回【已完成项目】的种子 → 用上并验证 → water
+  │
+  ├─ 会话结束 → 只记录，不播种
+  │    ├─ AI 总结这次做了什么 + 列出未完成事项
+  │    ├─ 判断项目状态：ongoing / complete / unknown
+  │    ├─ 生成会话节点（钥匙 s-XXXXXXXX），指向上一个会话
+  │    └─ 写 .trees/last-key，下一次自动接上
+  │
+  ├─ 同一项目继续开会话 → 形成链 A → B → C
+  │
+  └─ 项目完成（AI 判断 + 条件满足）
+       ├─ 选中的链合并成项目大树 TREES
+       ├─ ★ 这时才第一次播种：从整条链的材料里提取种子
+       ├─ 会话树标 merged_into，原件保留
+       └─ 旁支：单独播种（plant-branch）或回收（recycle）
+
+之后
+  种子：浇水 → 生长 → 互补合成（人审）→ 高级种子 → 长期不用入盒
+  会话树：无人接续 → 枯树休眠 → 回收
 ```
 
-一个项目做完就播一次种。下次碰到对得上号的情境，种子被捞出来用；用上了并且验证通过，才算浇了一次水。同一类情境反复用够次数，又碰上互补的伙伴，才有资格合成为更高级的种子。长期用不上的，先收进盒子，等哪天需要了再召唤回来。
+一个长项目可以跨很多会话，但**只有完成的项目才会播种**。做了一半放弃的会话树只是原料，不会往经验库里放半成品判断。
+
+同一类情境反复用够 5 次，又碰上互补的伙伴，种子才有资格合成为更高级的经验。长期用不上的，先收进盒子，等哪天需要了再召唤回来。
 
 ## 概念
 
@@ -125,17 +142,20 @@ cd Trees/tools && npm link
 trees status
 ```
 
-数据默认放在 `./forest`，想换位置就设蒸馏（按需蒸馏 —— 这个项目的核心）
+数据默认放在 `./forest`，想换位置就设 `TREES_HOME`：
+
+```bash
+TREES_HOME=/path/to/my-forest trees status
+```
+
+## 蒸馏（按需蒸馏 —— 这个项目的核心）
+
+```
   trees candidates                 扫全库，找出互补的种子对
   trees synthesize <a> <b>         把两颗互补的种子蒸馏成一颗高级种子
   trees unsynthesize <id>          拆回原件（原件一直都在，合成从不删东西）
   trees waiting                    列出正在等前置的种子
   trees need <id> --for "<前置>"    登记前置（种子 id 或还没出现的描述）
-
-环境变量：
-
-```bash
-TREES_HOME=/path/to/my-forest trees status
 ```
 
 ## 文件长什么样
@@ -210,13 +230,24 @@ seeds: ["seed-0001"]
   trees show <seed-id>             看种子详情
   trees water <seed-id> [--fail]   浇水（成功 +1 并推进状态；--fail 记失败且不推进）
   trees find <关键词>              按标题 / 标签 / 正文检索
+  trees recall "<任务描述>"         召回该带进上下文的种子（默认 5 颗 / 4000 token）
   trees box <seed-id>              入盒（休眠）
   trees summon <seed-id>           召唤出盒
+  trees sweep                      把 180 天没浇水的种子送进盒子
 
 大树 / 森林
   trees trees                      列出所有大树
   trees tree <tree-id>             看一棵树（含挂在它下面的种子）
   trees forest <子树> --under <父树>   建强关联（自动防环）
+
+项目链（长项目跨会话）
+  trees tip                        看当前接续点、上次会话和未完成事项
+  trees use <s-XXXXXXXX>           回档 / 切换接续点
+  trees finish <s-XXXXXXXX>        合并会话链并首次播种
+  trees unfinish <proj-id>         拆回项目树
+  trees plant-branch <s-XXXXXXXX>  把旁支单独播种
+  trees recycle <s-XXXXXXXX>       旁支回收（休眠）
+  trees plant-project <proj-id>    重新播种一个项目
 
 黑夜循环（系统自跑）
   trees dream [seed-id...]         今晚该学哪几颗（只出计划，不花钱）
@@ -229,6 +260,8 @@ seeds: ["seed-0001"]
   trees config [--from-env]        把模型配置存下来（定时任务读的是这份）
 
 环境
+  trees index                      生成 forest/index.md（几 KB 的目录，给新会话注入）
+  trees index --print [--if-any]   只打印不落盘；--if-any 空库时什么都不输出
   trees init [--dry-run]           初始化数据目录（幂等）
   trees status                     总览 + AI 能力画像
 ```
@@ -254,6 +287,37 @@ buried ──浇水1次──▶ sprouting ──浇水≥2──▶ growing ─
 状态变化只看 `watered` 的次数，以及距 `last_watered` 过了多久。时间从上次使用算起，`born` 不参与。
 
 `failed` 也不参与状态计算。失败会记下来，作为判断种子质量的证据，但不会让种子降级。入盒同样按 `last_watered` 算：种得再早，只要一直有人用，就该留在库里。
+
+## 会话链与项目完成
+
+长项目跨会话，所以会话不是项目，**会话树只是原料**：
+
+- **会话树** `s-XXXXXXXX`：一次会话的总结、未完成事项、接续指针。
+- **项目大树**：一条会话链合并而成，代表一个**已完成**的项目。
+- **种子只从项目大树里出**。项目没完成，一颗都不播。
+
+```bash
+trees tip                       # 当前接续点、上次会话、未完成事项
+trees use s-7F3KQ2M1            # 回档：从这个节点重新开一条分支
+trees finish s-7F3KQ2M1         # 合并链并首次播种
+trees unfinish proj-7F3KQ2M1    # 拆回
+trees plant-branch s-XXXX       # 旁支单独播种
+trees recycle s-XXXX            # 旁支回收
+```
+
+自动模式：
+
+```bash
+trees auto --enable             # 会话结束自动记录（默认关闭）
+trees auto --finish             # 项目完成时自动合并并播种
+trees auto --status             # 看开关、模型和最近回写
+```
+
+完成判断由本机 AI 做：`complete` + 没有未完成事项 + 没有后续会话，且（用户明确说过完成，或连续两次判断 complete）才会合并。**会话结束本身不算完成。**
+
+旁支（没被选进合并链的分支）默认休眠，不会自动播种——低权重的半成品判断混进库里，只会让召回变脏。要它的经验就 `plant-branch`，不要就等回收。
+
+会话文本会发给配置的模型，发送前会遮掉疑似密钥。
 
 ## 让它在夜里自己学
 
@@ -341,7 +405,7 @@ trees grow --uninstall     # 卸掉
 1. v0.1：核心数据层 + CLI（已完成）
 2. v0.2：`plant` / `synthesize` —— 今天能跑通「项目 → 种子 → 合成」全链路（已完成）
 3. v0.3：MCP 适配器，让 Claude Code 和 Cursor 直接接入
-4. v0.4：黑夜循环。挑种与预算已完成，接入模型那一步待做
+4. v0.4：黑夜循环（已完成 —— 挑种、预算、接模型都通了）
 5. v1.0：种子包导入导出，AI 能力画像正式接入派单
 
 ## 铁律

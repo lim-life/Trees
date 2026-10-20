@@ -98,10 +98,11 @@ export function parseSections(body) {
   const marks = [];
   let m;
   while ((m = re.exec(text)) !== null) {
-    marks.push({ name: m[1].trim(), bodyStart: m.index + m[0].length });
+    // 记下标题起始位置：CRLF 时 m[0] 会带上 \r，不能再按长度反推
+    marks.push({ name: m[1].trim(), start: m.index, bodyStart: m.index + m[0].length });
   }
   marks.forEach((mk, i) => {
-    const end = i + 1 < marks.length ? marks[i + 1].bodyStart - (marks[i + 1].name.length + 3) : text.length;
+    const end = i + 1 < marks.length ? marks[i + 1].start : text.length;
     const chunk = text.slice(mk.bodyStart, end).trim();
     if (Object.prototype.hasOwnProperty.call(out, mk.name)) out[mk.name] = chunk;
     else out.其他 += `## ${mk.name}\n${chunk}\n`;

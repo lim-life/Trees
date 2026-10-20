@@ -58,16 +58,33 @@ If only the later one exists and the prerequisite never showed up, it just sits 
 ## The loop in practice
 
 ```
-Project finished → plant → bury
-                            ↓
-Next project → match context → water (used + verified) → grow
-                            ↓
-  5 waterings in the same context + strong complementarity → merge into an advanced seed (human review)
-                            ↓
-                      not watered for 6 months → box (dormant)
+Project starts
+  │
+  ├─ Session starts → inject library index + the project's continuation point
+  │    └─ Work: recall seeds from COMPLETED projects → use + verify → water
+  │
+  ├─ Session ends → record only, no planting
+  │    ├─ AI summarizes what happened + lists open threads
+  │    ├─ AI judges the project: ongoing / complete / unknown
+  │    ├─ Create a session node (key s-XXXXXXXX) pointing at the previous session
+  │    └─ Write .trees/last-key so the next session continues automatically
+  │
+  ├─ More sessions for the same project → a chain A → B → C
+  │
+  └─ Project complete (AI judgment + conditions met)
+       ├─ The chosen chain merges into one project tree (TREES)
+       ├─ ★ First planting: seeds are extracted from the whole chain
+       ├─ Session trees keep their originals, marked merged_into
+       └─ Side branches: plant separately (plant-branch) or recycle
+
+Afterwards
+  Seeds: water → grow → merge complementary ones (human review) → advanced → box when idle
+  Session trees: no continuation → dormant → recycled
 ```
 
-Every finished project plants its seeds once. The next time a matching context comes up, those seeds get pulled out and used; they are only watered after they have been used *and* verified. Once a seed has been reused enough times in the same kind of context, and it has a complementary partner, it becomes eligible to merge into something more advanced. Seeds nothing reaches for go into the box for a while, and can be summoned back when they are needed again.
+A long project may span many sessions, but **only a completed project plants seeds**. Session trees from unfinished work are raw material, not lessons: half-formed judgments never enter the library.
+
+Once a seed has been reused enough times in the same kind of context, and it has a complementary partner, it becomes eligible to merge into something more advanced. Seeds nothing reaches for go into the box for a while, and can be summoned back when they are needed again.
 
 ## Concepts
 
@@ -96,7 +113,6 @@ node bin/cli.js help        # list the commands
 node tests/run.mjs          # run the self-tests (120 of them)
 ```
 
-The first command lists what's available; the second runs the self-tests (58 of them).
 
 If you want something to browse first, there's a sample forest in the repo. Its 4 seeds all came from pitfalls encountered while building Trees itself:
 
@@ -204,13 +220,24 @@ Seeds
   trees show <seed-id>             show seed details
   trees water <seed-id> [--fail]   water a seed (success: +1 and advance state; --fail: record a failure, don't advance)
   trees find <keyword>             search titles / labels / body
+  trees recall "<task>"            pull the seeds this task needs (5 seeds / 4000 tokens by default)
   trees box <seed-id>              put a seed in the box (dormant)
   trees summon <seed-id>           summon a seed back out of the box
+  trees sweep                      box seeds that haven't been watered in 180 days
 
 Trees / forests
   trees trees                      list all trees
   trees tree <tree-id>             show one tree (including the seeds attached to it)
   trees forest <child> --under <parent>   link trees together (cycles are prevented automatically)
+
+Project chains (long projects across sessions)
+  trees tip                        current continuation point, last session, open threads
+  trees use <s-XXXXXXXX>           roll back / switch the continuation point
+  trees finish <s-XXXXXXXX>        merge the session chain and plant
+  trees unfinish <proj-id>         split the project tree back apart
+  trees plant-branch <s-XXXXXXXX>  plant an abandoned branch separately
+  trees recycle <s-XXXXXXXX>       recycle an abandoned branch (dormant)
+  trees plant-project <proj-id>    re-plant a project
 
 Distillation (distill on demand — the core of this project)
   trees candidates                 scan the library for complementary pairs
@@ -230,6 +257,8 @@ Nightly loop (runs on its own)
   trees config [--from-env]        save the model settings (the scheduled run reads these)
 
 Environment
+  trees index                      write forest/index.md (a few KB, injected into new sessions)
+  trees index --print [--if-any]   print only; --if-any stays silent on an empty library
   trees init [--dry-run]           initialize the data directory (idempotent)
   trees status                     overview + AI capability profile
 ```
@@ -255,6 +284,37 @@ buried ──1 watering──▶ sprouting ──≥2 waterings──▶ growing
 State changes depend on the `watered` count and the time since `last_watered`. The clock starts at the last use, regardless of `born`.
 
 `failed` stays out of that calculation. A failure gets recorded as evidence about the seed's quality, but it won't demote the seed. Boxing also uses `last_watered`: an old seed that's still getting used belongs in the library.
+
+## Session chains and project completion
+
+A long project spans sessions, so a session is not a project: **a session tree is raw material**.
+
+- **Session tree** `s-XXXXXXXX`: one session's summary, open threads, and continuation pointer.
+- **Project tree**: a chain of session trees merged together, representing one **completed** project.
+- **Seeds only come from project trees.** An unfinished project plants nothing.
+
+```bash
+trees tip                       # continuation point, last session, open threads
+trees use s-7F3KQ2M1            # roll back: branch from an earlier node
+trees finish s-7F3KQ2M1         # merge the chain and plant for the first time
+trees unfinish proj-7F3KQ2M1    # split it back apart
+trees plant-branch s-XXXX       # plant an abandoned branch separately
+trees recycle s-XXXX            # recycle an abandoned branch
+```
+
+Automatic mode:
+
+```bash
+trees auto --enable             # record sessions automatically (off by default)
+trees auto --finish             # merge + plant when the project completes
+trees auto --status             # flags, model, and the last run
+```
+
+Completion is judged by the local AI: `complete` + no open threads + no later sessions, and either the user explicitly said it was done or two consecutive sessions agree. **A session ending is not completion.**
+
+Abandoned branches stay dormant and are never planted automatically — half-finished judgments would only pollute recall. Plant one with `plant-branch` if it has value, or let it be recycled.
+
+Session text is sent to your configured model, with key-like strings redacted first.
 
 ## Letting it study on its own
 
@@ -336,9 +396,8 @@ The core data layer is done, and all 120 self-tests pass:
 - `plant.js`: extracts seeds out of a finished project, separating real lessons from busywork
 - `bin/cli.js`: every command in the command reference above
 
-The LLM-dependent work is still ahead:
+Still ahead:
 
-- `dream`: run the overnight dream loop
 - `health`: health checks
 - MCP, Skill, and standalone adapters
 
@@ -347,7 +406,7 @@ The LLM-dependent work is still ahead:
 1. v0.1: core data layer + CLI (done)
 2. v0.2: `plant` / `synthesize` — the full project to seed to synthesis pipeline now runs (done)
 3. v0.3: MCP adapter for direct connections from Claude Code and Cursor
-4. v0.4: the nightly loop. Seed selection and budgeting are done; wiring it to a model is next
+4. v0.4: the nightly loop (done — selection, budgeting, and model calls all work)
 5. v1.0: seed pack import/export, with the AI capability profile wired into task assignment
 
 ## Ground rules

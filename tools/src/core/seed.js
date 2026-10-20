@@ -38,7 +38,7 @@ const WATER_THRESHOLD = Object.freeze({
 });
 
 /** 距最后一次浇水超过该天数即入盒 */
-const BOX_AFTER_DAYS = 180;
+export const BOX_AFTER_DAYS = 180;
 
 /** 召唤时 prev_state 缺失的回退状态 */
 const DEFAULT_SUMMON_STATE = 'growing';
@@ -762,6 +762,27 @@ export async function boxSeed(id) {
   const next = { ...seed };
   applyState(next, 'boxed');
   return writeSeed(next);
+}
+
+/**
+ * 定期巡检：把「超过 BOX_AFTER_DAYS 天没浇水」却还留在活跃目录里的种子送进盒子。
+ *
+ * 状态机只在浇水/合成时推进，所以一颗再也没人碰的种子永远不会自己入盒 ——
+ * 这个函数补上那条时间驱动的路径。纯写操作，dry-run 时不要调用。
+ *
+ * @param {{afterDays?:number}} [opts]
+ * @returns {Promise<Seed[]>} 这次入盒的种子（含 prev_state）
+ */
+export async function sweepAging(opts = {}) {
+  const afterDays = opts.afterDays ?? BOX_AFTER_DAYS;
+  const boxed = [];
+  for (const seed of await listSeeds({})) {
+    if (seed.state === 'boxed') continue;
+    if (computeAge(seed) < afterDays) continue;
+    const next = await boxSeed(seed.id);
+    if (next) boxed.push(next);
+  }
+  return boxed;
 }
 
 /**

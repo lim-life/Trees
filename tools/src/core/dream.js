@@ -20,7 +20,7 @@
  *      `applyLearning` 一律不碰。学习能让种子更**准**，但不能让它更**资深**。
  * ─────────────────────────────────────────────────────────
  */
-import { readSeed, writeSeed, listSeeds, seedAge } from './seed.js';
+import { readSeed, writeSeed, listSeeds, seedAge, sweepAging } from './seed.js';
 
 /** 每晚最多学几颗。硬上限，防止一晚上烧掉一堆。 */
 export const MAX_PER_NIGHT = 5;
@@ -42,6 +42,24 @@ const LEARNABLE_FIELDS = ['evidence', 'body'];
 
 /** 学习一律不许碰的字段 —— 资历只能靠真用过。 */
 const FORBIDDEN_FIELDS = ['watered', 'failed', 'state', 'last_watered', 'prev_state'];
+
+/** 取正文里某一段（## 判据 / ## 做法）的文本；找不到返回空串。 */
+function sectionText(body, title) {
+  const text = String(body || '');
+  const m = new RegExp(`^##\\s*${title}\\s*$`, 'm').exec(text);
+  if (!m) return '';
+  const rest = text.slice(m.index + m[0].length);
+  const next = rest.search(/^##\s*\S/m);
+  return (next === -1 ? rest : rest.slice(0, next)).trim();
+}
+
+/** 核心主张 = 判据 + 做法；正文没有结构化段落时退回全文比较。 */
+function coreClaim(body) {
+  const judge = sectionText(body, '判据');
+  const method = sectionText(body, '做法');
+  if (judge || method) return `${judge}\n${method}`;
+  return String(body || '').trim();
+}
 
 /**
  * 挑出今晚该学的种子。
@@ -150,7 +168,14 @@ export async function applyLearning(seedId, patch = {}) {
 
   const next = { ...seed };
   if (typeof patch.evidence === 'string') next.evidence = patch.evidence;
-  if (typeof patch.body === 'string') next.body = patch.body;
+  if (typeof patch.body === 'string') {
+    // 改「判据 / 做法」等于改主张 —— 没有证据就不许改，免得夜里被模型悄悄换掉
+    const coreChanged = coreClaim(patch.body) !== coreClaim(seed.body);
+    if (coreChanged && !String(patch.evidence || '').trim()) {
+      throw new Error('学习想改「判据 / 做法」，但没给 evidence —— 主张不能靠猜改，先说明依据');
+    }
+    next.body = patch.body;
+  }
 
   // 落盘前再核一遍：这几个字段必须和原来一模一样
   for (const key of FORBIDDEN_FIELDS) {
@@ -241,6 +266,8 @@ async function defaultCallModel(messages, maxTokens) {
  * @returns {Promise<{plan:object, results:Array, spentTokens:number, stopped:string|null}>}
  */
 export async function runDream(opts = {}) {
+  // 先把长期没浇水的收进盒子，再挑今晚该学的 —— 否则它们会一直留在活跃库里
+  if (!opts.dryRun) await sweepAging();
   const plan = await planDream(opts);
   if (opts.dryRun || !plan.picks.length) {
     return { plan, results: [], spentTokens: 0, stopped: opts.dryRun ? 'dry-run' : '没有该学的种子' };

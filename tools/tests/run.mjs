@@ -6,6 +6,7 @@
  */
 import { rm, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 // 必须在 import 核心模块之前设好 —— paths.js 启动时读它
@@ -62,6 +63,12 @@ const throws = async (fn) => {
   t('fm: 中文含冒号', back.title === data.title);
   t('fm: 引号与反斜杠还原', back.quote === data.quote);
   t('fm: 正文保留', parse(md).content.includes('## 判据'));
+
+  // 对象里的长数组：写成 "key: - x" 会整棵大树读不回来
+  const longList = ['seed-0001', 'seed-0002', 'seed-0003', 'seed-0004', 'seed-0005', 'seed-0006'];
+  const big = stringify({ id: 'x', branches: [{ branch_id: 'b', seeds_planted: longList }] }, '');
+  const bigBack = parse(big).data.branches[0].seeds_planted;
+  t('fm: 对象内长数组往返', Array.isArray(bigBack) && bigBack.length === 6 && bigBack[5] === 'seed-0006');
 }
 
 // ───────────────────────── seed 状态机 ─────────────────────────
@@ -386,6 +393,228 @@ const throws = async (fn) => {
 
   t('plant: 重复播种同一棵树会被拦', await throws(() => plant.plantFrom({ path: dir, callModel: fake })));
   t('plant: 空目录会报错', await throws(() => plant.plantFrom({ path: path.join(dir, 'nope'), callModel: fake })));
+}
+
+// ───────────────────────── 老化巡检 / 学习守门 / 流式 / 分支 ─────────────────────────
+{
+  const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+  const NL = String.fromCharCode(10);
+  const body = (j, m, n) => ['## 判据', j, '', '## 做法', m, '', '## 不适用', n].join(NL);
+
+  // ① 180 天没浇水 → 自动入盒
+  const stale = await seed.createSeed({
+    title: '很久没浇水', born: daysAgo(200), last_watered: daysAgo(200), body: body('a', 'b', 'c'),
+  });
+  const boxedNow = await seed.sweepAging();
+  const staleAfter = await seed.readSeed(stale.id);
+  t('sweep: 180 天没浇水自动入盒', staleAfter.state === 'boxed' && boxedNow.some((s) => s.id === stale.id));
+  t('sweep: 记下入盒前状态', staleAfter.prev_state === 'buried');
+
+  // ② 学习不许无证据改主张
+  const dream2 = await import('../src/core/dream.js');
+  const claim = await seed.createSeed({ title: '主张不许乱改', body: body('旧判据', '旧做法', '旧边界') });
+  t('learn: 无证据改判据被拒', await throws(() => dream2.applyLearning(claim.id, { body: body('新判据', '旧做法', '旧边界') })));
+  const withProof = await dream2.applyLearning(claim.id, { evidence: '依据 X', body: body('新判据', '新做法', '旧边界') });
+  t('learn: 带证据可以改主张', withProof.evidence === '依据 X' && withProof.body.includes('新判据'));
+  t('learn: 只改边界不需要证据', (await dream2.applyLearning(claim.id, { body: body('新判据', '新做法', '新边界') })).body.includes('新边界'));
+
+  // ③ 流式：能拼回完整输出、能识别截断
+  const { chat } = await import('../src/llm/chat.js');
+  const cfg = { baseUrl: 'https://x.test/v1', apiKey: 'k', model: 'm', timeoutMs: 1000 };
+  const sse = (chunks) => new Response(new ReadableStream({
+    start(ctrl) { const enc = new TextEncoder(); for (const x of chunks) ctrl.enqueue(enc.encode(x)); ctrl.close(); },
+  }), { status: 200 });
+  const good = async () => sse([
+    'data: {"model":"m","choices":[{"delta":{"content":"{\\"a\\":"}}]}' + NL + NL,
+    'data: {"choices":[{"delta":{"content":"1}"},"finish_reason":"stop"}],"usage":{"total_tokens":12}}' + NL + NL,
+    'data: [DONE]' + NL + NL,
+  ]);
+  const got = await chat({ messages: [{ role: 'user', content: 'x' }], config: cfg, fetchImpl: good });
+  t('llm: 流式拼回完整输出并记 usage', got.text === '{"a":1}' && got.usage.total_tokens === 12);
+  const cut = async () => sse(['data: {"choices":[{"delta":{"content":"半截"},"finish_reason":"length"}]}' + NL + NL]);
+  t('llm: finish_reason=length 报错', await throws(() => chat({ messages: [], config: cfg, fetchImpl: cut })));
+  const noEnd = async () => sse(['data: {"choices":[{"delta":{"content":"半截"}}]}' + NL + NL]);
+  t('llm: 没有结束标记也报错', await throws(() => chat({ messages: [], config: cfg, fetchImpl: noEnd })));
+
+  // ④ plant 把分支记到树上（复用上面 plant 块播过的树）
+  const radar = await tree.readTree('hand-sword-radar');
+  t('plant: 分支记到树上', (radar.branches || []).some((b) => b.model === 'test-model' && b.seeds_planted.length > 0));
+}
+
+// ───────────────────────── init --dry-run 不碰文件系统 ─────────────────────────
+{
+  const { spawnSync } = await import('node:child_process');
+  const { existsSync } = await import('node:fs');
+  const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'cli.js');
+  const target = path.join(HOME, 'initdry');
+  spawnSync(process.execPath, [cli, 'init', '--dry-run'], {
+    env: { ...process.env, TREES_HOME: target }, encoding: 'utf8',
+  });
+  t('init: --dry-run 不建目录', !existsSync(path.join(target, 'seeds')));
+}
+
+// ───────────────────────── 召回层 ─────────────────────────
+{
+  const rec = await import('../src/core/recall.js');
+  const NL = String.fromCharCode(10);
+  const B = (j, m, n) => ['## 判据', j, '', '## 做法', m, '', '## 不适用', n].join(NL);
+
+  const serial = await seed.createSeed({
+    title: 'ZephyrRTOS 固件烧录前枚举串口',
+    labels: ['召回测试', '串口', '烧录'],
+    body: B('在 ZephyrRTOS 板子上烧录固件时', '先枚举串口再传端口号', '产线端口已绑死时'),
+  });
+  await seed.createSeed({
+    title: 'ZephyrRTOS 编译缓存清理',
+    labels: ['召回测试', '编译'],
+    body: B('ZephyrRTOS 构建报缓存错误', '删 build 目录重编', '增量构建正常时'),
+  });
+  const dormant = await seed.createSeed({
+    title: 'ZephyrRTOS 旧烧录经验',
+    labels: ['召回测试', '串口', '烧录'],
+    body: B('ZephyrRTOS 烧录', '旧做法', '现在不用'),
+  });
+  await seed.boxSeed(dormant.id);
+
+  const r = await rec.recall('ZephyrRTOS 串口烧录');
+  t('recall: 最相关的排第一', r.picks[0]?.seed.id === serial.id, r.picks.map((p) => p.seed.title).join(' | '));
+  t('recall: 命中标签', Boolean(r.picks[0]?.matchedLabels.includes('串口')));
+  t('recall: 默认不召回盒子', !r.picks.some((p) => p.seed.id === dormant.id));
+  t('recall: --all 能召回盒子', (await rec.recall('ZephyrRTOS 串口烧录', { includeBoxed: true })).picks.some((p) => p.seed.id === dormant.id));
+  t('recall: 预算生效', (await rec.recall('ZephyrRTOS', { budget: 150, limit: 10 })).tokens <= 150);
+
+  const one = await rec.recall('ZephyrRTOS 串口烧录', { limit: 1, divergent: 2 });
+  t('recall: 发散列表与命中不重复', one.divergent.length > 0 && one.divergent.every((d) => d.id !== one.picks[0].seed.id));
+  t('recall: 空查询返回空', (await rec.recall('')).picks.length === 0);
+  const text = rec.renderRecall(one);
+  t('recall: 渲染成可注入文本', text.startsWith('## Trees 相关经验') && text.includes(serial.title));
+
+  // Windows 检出的文件是 CRLF —— 段落切分不能把下一个标题的 # 留在上一段
+  const ps = syn.parseSections('## 判据\r\nA\r\n\r\n## 做法\r\nB\r\n\r\n## 不适用\r\nC');
+  t('recall: CRLF 正文不串段', ps.判据 === 'A' && ps.做法 === 'B' && ps.不适用 === 'C');
+}
+
+// ───────────────────────── 索引 ─────────────────────────
+{
+  const idx = await import('../src/core/indexer.js');
+  const { stat } = await import('node:fs/promises');
+  const { spawnSync } = await import('node:child_process');
+
+  const r = await idx.renderIndex();
+  const active = (await seed.listSeeds({})).find((s) => s.state !== 'boxed');
+  const dormant = (await seed.listSeeds({})).find((s) => s.state === 'boxed');
+  t('index: 收录活跃种子', Boolean(active) && r.text.includes(active.title));
+  t('index: 休眠单独列在盒子', !dormant || (r.text.includes('## 盒子') && r.text.includes(dormant.id)));
+  t('index: 带上召回提示', r.text.includes('trees recall'));
+
+  const written = await idx.writeIndex();
+  t('index: 落盘', await stat(written.path).then(() => true).catch(() => false));
+
+  const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'cli.js');
+  const empty = path.join(HOME, 'indexempty');
+  const out = spawnSync(process.execPath, [cli, 'index', '--print', '--if-any'], {
+    env: { ...process.env, TREES_HOME: empty }, encoding: 'utf8',
+  });
+  t('index: 空库静默（hook 不制造噪音）', out.stdout.trim() === '');
+}
+
+// ───────────────────────── 会话链 / 项目完成 / 首次播种 ─────────────────────────
+{
+  const auto = await import('../src/core/session.js');
+  const project = await import('../src/core/project.js');
+  const { readFile, mkdir } = await import('node:fs/promises');
+  const NL = String.fromCharCode(10);
+
+  const jsonl = [
+    JSON.stringify({ type: 'user', message: { content: '帮我做一个雷达 PPT' } }),
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '先定共享样式再分页。' }, { type: 'tool_use', name: 'x', input: {} }] } }),
+    JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: '工具噪音' }] } }),
+    JSON.stringify({ type: 'user', message: { content: '<system-reminder>注入噪声</system-reminder>真正的需求' } }),
+  ].join(NL);
+  const text = auto.extractTranscript(jsonl);
+  t('auto: 只留对话文本', text.includes('帮我做一个雷达 PPT') && text.includes('先定共享样式')
+    && !text.includes('工具噪音') && !text.includes('注入噪声'));
+  const secretText = auto.extractTranscript(JSON.stringify({
+    type: 'user', message: { content: 'key 是 sk-abcdefghijklmnop1234 别泄露' },
+  }));
+  t('auto: 发送前遮掉密钥', !secretText.includes('sk-abcdefghijklmnop1234') && secretText.includes('sk-***'));
+
+  const logPath = path.join(HOME, 'auto.log');
+  const cwd = path.join(HOME, 'proj-home');
+  await mkdir(cwd, { recursive: true });
+
+  const summaryReply = (status, threads = [], explicit = false) => JSON.stringify({
+    title: '测试会话', summary: '这次做了一部分工作。', project_status: status,
+    status_reason: '依据', open_threads: threads, explicit_complete: explicit,
+  });
+  const seedReply = JSON.stringify({
+    tree: { id: 'auto-proj', title: '自动项目', type: '测试' },
+    seeds: [{ title: '完成项目后的经验', labels: ['auto'], criteria: 'c', method: 'm', notApplicable: 'n', evidence: 'session' }],
+    leaves: [],
+  });
+  // 会话归档和项目播种走同一个模型，用提示词区分
+  const fakeModel = (status, threads, explicit) => async (messages, maxTokens) => ({ // eslint-disable-line no-unused-vars
+    text: String(messages[0].content).includes('「播种」') ? seedReply : summaryReply(status, threads, explicit),
+    usage: { total_tokens: 60 },
+  });
+
+  const cfg = { autoPlant: true, autoFinish: false, model: 'fake' };
+  const material = '项目材料'.repeat(400);
+
+  t('auto: 默认关闭时跳过', (await auto.runAuto({ material, config: {}, cwd, minChars: 100, logPath })).skipped.includes('未开启'));
+  t('auto: 太短跳过', (await auto.runAuto({ material: '短', config: cfg, cwd, minChars: 100, logPath })).skipped.includes('太短'));
+
+  // 第一次会话：只记录，不播种
+  const r1 = await auto.runAuto({ material, cwd, config: cfg, minChars: 100, callModel: fakeModel('ongoing', ['还剩两页']), logPath });
+  const tree1 = await tree.readTree(r1.key);
+  t('session: 结束时只记录会话树', tree1?.kind === 'session' && tree1.project_status === 'ongoing');
+  t('session: 未完成项目不播种', (await seed.listSeeds({ from_tree: r1.key })).length === 0);
+
+  // 第二次会话自动接续
+  const r2 = await auto.runAuto({ material, cwd, config: cfg, minChars: 100, callModel: fakeModel('ongoing', ['还剩一页']), logPath });
+  t('session: 自动接续上一条链', (await tree.readTree(r2.key)).continues_from === r1.key);
+  t('session: 未完成不合并', (await project.evaluateChain(r2.key)).ready === false);
+
+  // 第三次会话明确完成 → 合并 + 首次播种
+  const r3 = await auto.runAuto({ material, cwd, config: cfg, minChars: 100, callModel: fakeModel('complete', [], true), logPath });
+  t('project: 明确完成即可合并', (await project.evaluateChain(r3.key)).ready === true);
+  const fin = await project.finishProject(r3.key, {
+    id: 'proj-auto-test', fromBranch: 'fake', callModel: fakeModel('complete', [], true),
+  });
+  const seedsAfter = await seed.listSeeds({ from_tree: 'proj-auto-test' });
+  t('project: 合并整条链并首次播种', fin.chain.length === 3 && seedsAfter.length > 0);
+  t('project: 会话树标 merged_into', (await tree.readTree(r1.key)).merged_into === 'proj-auto-test');
+
+  await project.unfinishProject('proj-auto-test');
+  t('project: 拆回后会话恢复、种子保留',
+    (await tree.readTree(r3.key)).merged_into === null
+    && (await seed.readSeed(seedsAfter[0].id)).from_tree === r3.key);
+
+  // 旁支：单独播种 / 回收
+  const branch = await tree.createTree({
+    id: 's-BRANCH001', title: '旁支会话', kind: 'session', root_path: cwd,
+    body: '## 本次做了什么\n做了一半\n\n## 关键决策\n\n\n## 下一步\n- 继续\n',
+  });
+  const pb = await project.plantBranch(branch.id, {
+    id: 'branch-test', fromBranch: 'fake', callModel: fakeModel('ongoing'),
+  });
+  t('project: 旁支单独播种', pb.seeds > 0 && (await tree.readTree('branch-test')) !== null);
+
+  const dormant = await tree.createTree({ id: 's-DORMANT1', title: '枯树', kind: 'session', root_path: cwd });
+  await project.recycleBranch(dormant.id);
+  t('project: 旁支可回收休眠', (await tree.readTree(dormant.id)).dormant === true);
+
+  // 自动合并
+  const cwd2 = path.join(HOME, 'proj-home-2');
+  await mkdir(cwd2, { recursive: true });
+  const r4 = await auto.runAuto({
+    material, cwd: cwd2, config: { autoPlant: true, autoFinish: true, model: 'fake' },
+    minChars: 100, callModel: fakeModel('complete', [], true), logPath,
+  });
+  t('auto: 满足条件自动合并并播种', Boolean(r4.mergedInto) && (await tree.readTree(r4.mergedInto)) !== null);
+  t('auto: 合并后清掉接续点', (await project.findLastKey(cwd2)) === null);
+
+  t('auto: 写了回写日志', (await readFile(logPath, 'utf8').catch(() => '')).includes('session'));
 }
 
 console.log(log.join('\n'));

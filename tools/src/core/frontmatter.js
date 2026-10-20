@@ -63,8 +63,15 @@ function stringifyArray(arr, indent = 0) {
         // 标准 YAML：首个字段跟在 "- " 之后，其余字段缩进对齐
         return entries
           .map(([k, v], idx) => {
-            const valueStr = Array.isArray(v) ? stringifyArray(v, indent + 4) : stringifyScalar(v);
-            return idx === 0 ? `${prefix}- ${k}: ${valueStr}` : `${prefix}  ${k}: ${valueStr}`;
+            const entry = idx === 0 ? `${prefix}- ${k}` : `${prefix}  ${k}`;
+            if (Array.isArray(v)) {
+              const inline = v.length === 0 || (v.every((it) => !isObject(it)) && v.length <= 3);
+              // 长数组必须换行缩进；写成 "key: - x" 不是合法 YAML，读回来会整棵树失效
+              return inline
+                ? `${entry}: ${stringifyArray(v, 0)}`
+                : `${entry}:\n${stringifyArray(v, indent + 4)}`;
+            }
+            return `${entry}: ${stringifyScalar(v)}`;
           })
           .join('\n');
       }
@@ -185,6 +192,15 @@ function parseBlockArray(lines, startIndex) {
         currentObj = null;
       }
       const val = content.slice(2).trim();
+      if (/^[^:]+:\s*$/.test(val)) {
+        // 对象开始，且第一个字段是嵌套块数组： "- key:" 后跟缩进的 "- x"
+        currentObj = {};
+        const key = val.slice(0, val.lastIndexOf(':')).trim();
+        const nested = parseBlockArray(lines, i + 1);
+        currentObj[key] = nested.value;
+        i = nested.nextIndex;
+        continue;
+      }
       if (val.includes(': ')) {
         // 对象项开始：解析内联键值对，如 "- name: Alice"
         currentObj = {};
@@ -200,6 +216,13 @@ function parseBlockArray(lines, startIndex) {
       if (content.includes(': ')) {
         const [k, v] = splitKeyValue(content);
         currentObj[k] = parseInlineValue(v);
+      } else if (/^[^:]+:\s*$/.test(content)) {
+        // 嵌套块数组： "key:" 后跟缩进的 "- x"
+        const key = content.slice(0, content.lastIndexOf(':')).trim();
+        const nested = parseBlockArray(lines, i + 1);
+        currentObj[key] = nested.value;
+        i = nested.nextIndex;
+        continue;
       }
     } else {
       // 无法识别的格式，终止
