@@ -36,6 +36,7 @@ born: 2026-10-16                 # 播种日
 last_watered: 2026-10-16         # 最后一次浇水日 —— 入盒判据用它,不用 born
 from_tree: hand-sword-radar       # 出自哪个大树
 from_branch: claude-opus-5-5      # 出自哪个分支(AI 归属)
+planter: zzx                     # 植树人(本地身份);自己种的召回权重最高
 origin: native                   # native(自己长的) | external(导入的)
 confidence: 1.0                  # native=1.0, external 初始 0.5
 bloodline: []                    # 合成来源 seed id 列表
@@ -66,6 +67,9 @@ type: 工业设计 / 硬件 / 演示
 created: 2026-09-20
 updated: 2026-10-16
 forest_id: null                  # 强关联时填父树 id
+planter: zzx                     # 植树人;自己种的树权重最高
+plaque: 从结构分析到 14 页可演示的原型   # 树牌:一句话说清这棵树解决什么问题(列表只显示它)
+labels: [工业设计, 硬件, 演示]      # 树牌标签:别人先按标签判断要不要打开
 root_path: F:\项目\双手雷达PPT\
 branches:
   - branch_id: design
@@ -128,6 +132,23 @@ seeds: [seed-0012, seed-0015, seed-0018]
 ### 规则 6 — 合成不删原件
 - 合成后原种子保留,只标 `synthesized_into: <新id>`
 - 可回拆
+
+### 规则 7 — 人人都是植树人,自己的树权重最高
+- 每颗种子、每棵大树都记 `planter`(本地身份,来自 `forest/config.json`)
+- 召回排序:**自己种的 > 本机导入的 > 陌生人共享的**
+  - 自己的树:权重 1.0
+  - 他人/导入的树:按 `confidence` 降权(external 初始 0.5,验证 3 次升满)
+- 权重只影响**召回排序与可见度**,不改 `watered` / `state` / `last_watered`
+- 权重是「信任的先后」,不是「谁更对」——别人的树被浇水够多,一样能反超
+
+### 规则 8 — 树牌先行,详情按需
+- 每棵大树必须有一块**树牌**:一句话总结(`plaque`)+ 标签(`labels`)+ 植树人 + 复用证据(`watered` / 出种数)
+- 列表、索引、`forest/index.md` **只显示树牌**,不展示正文
+- 完整内容(`项目做了什么` / `关键决策` / `复用说明`)只在 `trees tree <id>` 时打开
+- 树牌在播种时自动生成,人可改
+- 树牌**不是抽象**,只是入口;正文里具体经验原样保留,不因树牌丢掉上下文
+
+> 证据阶梯、结构分层与两类先知的完整规则见 [03-共享森林框架.md](03-共享森林框架.md)。
 
 ---
 
