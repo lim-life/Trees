@@ -14,6 +14,7 @@
  *   - 也可以用 `apiKeyEnv` 指定从哪个环境变量读 key，文件里就不存 key
  */
 import { readFile, writeFile, mkdir, chmod } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { getForestRoot } from './paths.js';
 
@@ -61,4 +62,25 @@ export async function unsetConfig(keys) {
   await mkdir(dir, { recursive: true });
   await writeFile(configPath(), `${JSON.stringify(cfg, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
   return configPath();
+}
+
+/**
+ * 本地植树人身份（规则 7）。
+ * 顺序：config.planter → TREES_PLANTER → 操作系统用户名 → 'local'。
+ * 身份只用于召回排序与归属，不做资格审核。
+ * @returns {Promise<string>}
+ */
+export async function getPlanter() {
+  const cfg = await readConfig();
+  const fromConfig = String(cfg.planter || '').trim();
+  if (fromConfig) return fromConfig;
+
+  const fromEnv = String(process.env.TREES_PLANTER || '').trim();
+  if (fromEnv) return fromEnv;
+
+  try {
+    return os.userInfo().username || 'local';
+  } catch {
+    return 'local';
+  }
 }

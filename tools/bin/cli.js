@@ -14,7 +14,7 @@ import { ensureDirs, getForestRoot } from '../src/core/paths.js';
 import {
   createSeed, readSeed, listSeeds, waterSeed, boxSeed, summonSeed, sweepAging,
 } from '../src/core/seed.js';
-import { listTrees, readTree, getTreeSeeds, linkSeed } from '../src/core/tree.js';
+import { listTrees, readTree, writeTree, getTreeSeeds, linkSeed } from '../src/core/tree.js';
 import { linkForest, getForestMembers } from '../src/core/forest.js';
 import {
   findCandidates, synthesizeSeed, unsynthesize, SYNTH_MIN_WATERED,
@@ -23,8 +23,14 @@ import {
 import {
   planDream, runDream, FRESH_DAYS, ROTTING_MARGIN_DAYS,
 } from '../src/core/dream.js';
-import { readConfig, writeConfig, configPath } from '../src/core/config.js';
+import { readConfig, writeConfig, configPath, getPlanter } from '../src/core/config.js';
+import { listEvents, verifyEvents } from '../src/core/events.js';
 import { plantFrom } from '../src/core/plant.js';
+import { shareTree } from '../src/core/share.js';
+import { findDuplicates, judgePair } from '../src/core/dedup.js';
+import { scoreSeed, scoreMissing, scorerCallModel } from '../src/core/scorer.js';
+import { summarize } from '../src/core/stats.js';
+import { searchSeeds, planQuery, fallbackPlan } from '../src/core/space.js';
 import { recall, renderRecall } from '../src/core/recall.js';
 import { renderIndex, writeIndex } from '../src/core/indexer.js';
 import { runAuto, readAutoLog, autoLogPath } from '../src/core/session.js';
@@ -94,7 +100,13 @@ ${c.cyan}种子${c.reset}
   trees ls [--state <状态>]        列出种子
   trees show <seed-id>             看种子详情
   trees water <seed-id> [--fail]   浇水（成功 +1 并推进状态；--fail 记失败且不推进）
+  trees score <seed-id> [--force]  给种子打静态向量（D1/D2/D4）+ D3 先验
+  trees score --missing [--limit N] 给还没有向量的种子补分
   trees find <关键词>              按标题/标签/正文检索
+  trees search "<任务>" [--limit N] [--no-ai] [--json]
+                                   文本召回 + 四维过滤（管理 AI 出检索计划）
+  trees dedup [--threshold 0.7] [--ai] [--json]
+                                   查重：精确重复 + 近重复；--ai 判 same/subset/overlap/different
   trees recall "<任务描述>" [--limit N] [--budget N] [--all] [--json]
                                    召回该带进上下文的种子（默认 5 颗 / 4000 token）
   trees box <seed-id>              入盒（休眠）
@@ -104,6 +116,9 @@ ${c.cyan}种子${c.reset}
 ${c.cyan}大树 / 森林${c.reset}
   trees trees [--all]              列出所有大树（默认不看会话节点）
   trees tree <tree-id>             看一棵树（含挂在它下面的种子）
+  trees plaque <tree-id> ["一句话"] [--labels a,b]
+                                   看/改树牌（列表只显示树牌）
+  trees share <tree-id>            把这棵树和它的种子打成可 git 发布的包（默认全部私有）
   trees forest <子树> --under <父树>   建强关联（自动防环）
 
 ${c.cyan}蒸馏${c.reset} ${c.dim}（按需蒸馏 —— 这个项目的核心）${c.reset}
@@ -147,8 +162,11 @@ ${c.cyan}会话回写${c.reset} ${c.dim}（会话结束只记录，不播种；�
 ${c.cyan}索引 / 环境${c.reset}
   trees index                      生成 forest/index.md（几 KB 的目录，给新会话注入）
   trees index --print [--if-any]   只打印不落盘；--if-any 空库时什么都不输出
+  trees events [--limit N] [--seed <id>] [--type <类型>] [--verify]
+                                   看事件账本；--verify 校验哈希链是否被改过
   trees init [--dry-run]           初始化数据目录（幂等）
   trees status                     总览
+  trees stats [--json]             统计：状态/植树人/事件/调用（不花模型钱）
 
 ${c.cyan}尚未实现${c.reset} ${c.dim}（需要接 LLM，见 docs/00-SPEC.md §5）${c.reset}
   health  import  export  profile  uninstall
@@ -720,6 +738,21 @@ async function cmdPlant() {
       });
     }
 
+    if (r.reused?.length) {
+      console.log(`
+♻️ 复用 ${r.reused.length} 颗已有种子：`);
+      for (const s of r.reused) console.log(`   ${s.id}  ${s.title}`);
+    }
+
+    if (r.duplicatesSkipped?.length) {
+      console.log(`
+♻️ 重复处理 ${r.duplicatesSkipped.length} 条：`);
+      for (const d of r.duplicatesSkipped) {
+        const how = d.reused ? `复用 ${d.duplicateOf}` : '本批重复，已跳过';
+        console.log(`   ${d.title}  ${c.dim}← ${how}${c.reset}`);
+      }
+    }
+
     if (r.leaves.length) {
       console.log(`
 🍂 ${r.leaves.length} 条落叶：${c.dim}${r.leaves.join(' / ')}${c.reset}`);
@@ -743,6 +776,16 @@ async function cmdConfig() {
   if (valueOf('--model')) patch.model = valueOf('--model');
   if (valueOf('--api-key')) patch.apiKey = valueOf('--api-key');
   if (valueOf('--api-key-env')) patch.apiKeyEnv = valueOf('--api-key-env');
+  if (valueOf('--planter')) patch.planter = valueOf('--planter');
+
+  const scorerPatch = {};
+  if (valueOf('--scorer-base-url')) scorerPatch.baseUrl = valueOf('--scorer-base-url');
+  if (valueOf('--scorer-model')) scorerPatch.model = valueOf('--scorer-model');
+  if (valueOf('--scorer-api-key')) scorerPatch.apiKey = valueOf('--scorer-api-key');
+  if (Object.keys(scorerPatch).length) {
+    const current = await readConfig();
+    patch.scorer = { ...(current.scorer || {}), ...scorerPatch };
+  }
   if (hasFlag('--from-env')) {
     if (process.env.TREES_LLM_BASE_URL) patch.baseUrl = process.env.TREES_LLM_BASE_URL;
     if (process.env.TREES_LLM_MODEL) patch.model = process.env.TREES_LLM_MODEL;
@@ -767,6 +810,217 @@ async function cmdConfig() {
   console.log(`   地址  ${cfg.baseUrl || c.dim + '（没设）' + c.reset}`);
   console.log(`   模型  ${cfg.model || c.dim + '（没设）' + c.reset}`);
   console.log(`   Key   ${cfg.apiKey ? '已存（明文，别提交）' : (cfg.apiKeyEnv ? `从环境变量 ${cfg.apiKeyEnv} 读` : c.dim + '（没设）' + c.reset)}`);
+  console.log(`   植树人 ${cfg.planter || c.dim + `（未设置，当前用 ${await getPlanter()}）` + c.reset}`);
+  console.log(`   打分器 ${cfg.scorer?.model ? `${cfg.scorer.model}${cfg.scorer.baseUrl ? `（${cfg.scorer.baseUrl}）` : ''}` : c.dim + '未单独配置，回退到上面的模型' + c.reset}`);
+}
+
+/** 向量打分：只打 D1/D2/D4 + D3 先验，不做真假/投票。 */
+async function cmdScore() {
+  if (hasFlag('--missing')) {
+    const done = await scoreMissing({
+      limit: Number(valueOf('--limit')) || 20,
+      force: hasFlag('--force'),
+    });
+    if (!done.length) return console.log(`${c.dim}没有需要打分的种子。${c.reset}`);
+    for (const item of done) {
+      const { seed, score } = item;
+      console.log(`${seed.id}  D1 ${score.d1} / D2 ${score.d2} / D4 ${score.d4}  ${seed.title}`);
+    }
+    console.log(`${c.dim}共 ${done.length} 颗。${c.reset}`);
+    return;
+  }
+
+  const id = args[0] && !args[0].startsWith('-') ? args[0] : '';
+  if (!id) return err('用法：trees score <seed-id> [--force] | trees score --missing [--limit N]');
+  const result = await scoreSeed(id, { force: hasFlag('--force') });
+  if (!result) return err(`没有这颗种子：${id}`);
+  const { seed, score } = result;
+  console.log(`${seed.id}  ${seed.title}`);
+  console.log(`   D1 抽象度 ${score.d1}  ·  D2 领域 ${score.d2}  ·  D4 风险 ${score.d4}`);
+  console.log(`   D3 先验调用价值 ${score.d3}  ${c.dim}（之后只由事件更新）${c.reset}`);
+  console.log(`   ${c.dim}${score.scorer} / ${score.model} / ${score.scored_at}${c.reset}`);
+}
+
+/** 统计：全部由本地数据算，不调模型。 */
+async function cmdStats() {
+  const report = summarize({
+    seeds: await listSeeds({}),
+    trees: await listTrees(),
+    events: await listEvents({ limit: Number.MAX_SAFE_INTEGER }),
+  });
+  if (hasFlag('--json')) return console.log(JSON.stringify(report, null, 2));
+
+  const states = Object.entries(report.seeds.byState).map(([k, v]) => `${k} ${v}`).join('  ');
+  const types = Object.entries(report.events.byType).map(([k, v]) => `${k} ${v}`).join('  ');
+  console.log(`种子 ${report.seeds.total}  ·  大树 ${report.trees.total}  ·  事件 ${report.events.total}`);
+  console.log(`状态 ${states || '(空)'}`);
+  console.log(`浇水 ${report.seeds.watered}  ·  失败 ${report.seeds.failed}`);
+  console.log(`事件 ${types || '(空)'}`);
+  const planters = Object.entries(report.planters);
+  if (planters.length) console.log(`植树人 ${planters.map(([k, v]) => `${k} ${v}`).join('  ')}`);
+}
+
+/** 检索：管理 AI 出计划 → 文本召回 → 四维过滤。 */
+async function cmdSearch() {
+  const query = args.filter((a) => !a.startsWith('-')).join(' ').trim();
+  if (!query) return err('用法：trees search "<任务>" [--limit N] [--no-ai] [--json]');
+
+  const seeds = (await listSeeds({})).filter((s) => s.state !== 'boxed');
+  let plan;
+  if (hasFlag('--no-ai')) {
+    plan = fallbackPlan(query);
+  } else {
+    try {
+      plan = await planQuery(query, { callModel: await scorerCallModel() });
+    } catch {
+      plan = fallbackPlan(query);
+    }
+  }
+
+  const result = searchSeeds(query, seeds, {
+    plan,
+    limit: Number(valueOf('--limit')) || 8,
+  });
+
+  if (hasFlag('--json')) return console.log(JSON.stringify(result, null, 2));
+
+  console.log(`计划 ${plan.source}  keywords [${plan.keywords.join(', ')}]`);
+  console.log(`     D1 ${plan.d1_min}~${plan.d1_max} · D2 ${plan.d2_min}~${plan.d2_max} · D4 ≤ ${plan.d4_max}`);
+  if (!result.results.length) {
+    console.log(`${c.dim}没有命中。${c.reset}`);
+    return;
+  }
+  for (const item of result.results) {
+    const v = item.vector
+      ? `D1 ${item.vector.d1} / D2 ${item.vector.d2} / D4 ${item.vector.d4}`
+      : '未打分';
+    console.log(`  ${item.score}  ${item.id}  ${item.title}  ${c.dim}${v}${c.reset}`);
+  }
+}
+
+/** 查重：只报告，不删除、不改种子。近重复是否同义交给模型判。 */
+async function cmdDedup() {
+  const near = Number(valueOf('--threshold')) || 0.7;
+  const seeds = await listSeeds({});
+  const { exactGroups, nearPairs } = findDuplicates(seeds, { near });
+
+  let judged = nearPairs;
+  if (hasFlag('--ai') && nearPairs.length) {
+    const limit = Number(valueOf('--limit')) || 10;
+    const { chat } = await import('../src/llm/chat.js');
+    const callModel = (messages, maxTokens) => chat({ messages, maxTokens });
+    judged = [];
+    for (const pair of nearPairs.slice(0, limit)) {
+      try {
+        judged.push({ ...pair, ai: await judgePair(pair, callModel) });
+      } catch (error) {
+        judged.push({ ...pair, aiError: error.message });
+      }
+    }
+  }
+
+  if (hasFlag('--json')) {
+    console.log(JSON.stringify({
+      total: seeds.length,
+      exactGroups: exactGroups.map((g) => g.seeds.map((s) => ({ id: s.id, title: s.title }))),
+      nearPairs: judged.map((p) => ({
+        a: { id: p.a.id, title: p.a.title },
+        b: { id: p.b.id, title: p.b.title },
+        score: p.score,
+        verdict: p.verdict,
+        ai: p.ai || null,
+        aiError: p.aiError || null,
+      })),
+    }, null, 2));
+    return;
+  }
+
+  if (!exactGroups.length && !nearPairs.length) {
+    console.log(`✓ 没有发现重复（扫了 ${seeds.length} 颗）`);
+    return;
+  }
+
+  if (exactGroups.length) {
+    console.log(`\n${c.red}精确重复 ${exactGroups.length} 组${c.reset}（归一化后完全相同）`);
+    for (const group of exactGroups) {
+      console.log(`  ${group.seeds.map((s) => `${s.id} ${s.title}`).join('  ＝  ')}`);
+    }
+  }
+
+  if (judged.length) {
+    console.log(`\n${c.yellow}近重复 ${judged.length} 对${c.reset}（阈值 ${near}）`);
+    for (const pair of judged) {
+      const ai = pair.ai ? `  → ${pair.ai.verdict}：${pair.ai.reason}` : '';
+      const err = pair.aiError ? `  → AI 失败：${pair.aiError}` : '';
+      console.log(`  ${pair.score}  ${pair.a.id} ${pair.a.title}  ↔  ${pair.b.id} ${pair.b.title}${ai}${err}`);
+    }
+    if (!hasFlag('--ai')) console.log(`${c.dim}   加 --ai 让模型判断是不是同一条（same / subset / overlap / different）${c.reset}`);
+  }
+}
+
+/** 树牌：一句话 + 标签；列表/索引只显示它，正文按需展开。 */
+async function cmdPlaque() {
+  const id = args[0] && !args[0].startsWith('-') ? args[0] : '';
+  if (!id) return err('用法：trees plaque <tree-id> ["一句话"] [--labels a,b]');
+
+  const tree = await readTree(id);
+  if (!tree) return err(`没有这棵大树：${id}`);
+
+  const text = args[1] && !args[1].startsWith('-') ? args[1] : '';
+  const labelsRaw = valueOf('--labels');
+  const patch = {};
+  if (text) patch.plaque = text;
+  if (labelsRaw) patch.labels = labelsRaw.split(',').map((x) => x.trim()).filter(Boolean);
+
+  const next = Object.keys(patch).length ? await writeTree({ ...tree, ...patch }) : tree;
+  console.log(`${c.cyan}${next.id}${c.reset}  ${next.plaque || c.dim + '(无树牌)' + c.reset}`);
+  console.log(`   标签：${(next.labels || []).join(', ') || '(无)'}`);
+  console.log(`   植树人：${next.planter || '(未知)'}  ·  ${(next.branches || []).length} 分支 / ${(next.seeds || []).length} 种子`);
+}
+
+/** 选择性发布：只把这棵树和它挂着的种子放进 git 发布包。 */
+async function cmdShare() {
+  const id = args[0] && !args[0].startsWith('-') ? args[0] : '';
+  if (!id) return err('用法：trees share <tree-id>');
+
+  const { dir, manifest } = await shareTree(id);
+  console.log(`📦 发布包：${dir}`);
+  console.log(`   ${manifest.seeds.length} 颗种子 · 树牌：${manifest.tree.plaque || '(无)'}`);
+  console.log(`${c.dim}只复制这棵树挂着的种子；没有联网，也没有删除任何东西。${c.reset}`);
+  console.log(`${c.dim}下一步：把整个目录提交到公开 git 仓库；订阅方先核对 manifest.json 里的 sha256。${c.reset}`);
+}
+
+/** 事件账本：谁在什么时候对哪颗种子做了什么。 */
+async function cmdEvents() {
+  if (hasFlag('--verify')) {
+    const result = await verifyEvents();
+    if (result.ok) {
+      console.log(`✓ 账本完整：${result.count} 条（链式 ${result.chained} / 旧格式 ${result.legacy}）`);
+      console.log(`  head ${result.head || '(空)'}`);
+    } else {
+      console.log(`✗ 账本在第 ${result.brokenAt} 条断裂：${result.reason}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  const events = await listEvents({
+    limit: Number(valueOf('--limit')) || 30,
+    type: valueOf('--type') || '',
+    seed: valueOf('--seed') || '',
+    tree: valueOf('--tree') || '',
+    actor: valueOf('--actor') || '',
+  });
+  if (!events.length) {
+    console.log(`${c.dim}账本还是空的 —— 播种或浇水之后再来。${c.reset}`);
+    return;
+  }
+  for (const e of events) {
+    const who = e.actor ? ` ${e.actor}` : '';
+    const target = e.seed || e.tree || '';
+    const title = e.title ? `  ${e.title}` : '';
+    console.log(`${c.dim}${e.ts}${c.reset}  ${e.type.padEnd(6)}${who}  ${target}${title}`);
+  }
 }
 
 async function cmdGrow() {
@@ -944,11 +1198,13 @@ async function main() {
 
   const table = {
     init: cmdInit, new: cmdNew, ls: cmdLs, list: cmdLs, show: cmdShow, water: cmdWater,
-    find: cmdFind, recall: cmdRecall, box: cmdBox, summon: cmdSummon, sweep: cmdSweep,
-    trees: cmdTrees, tree: cmdTree, forest: cmdForest, status: cmdStatus,
+    find: cmdFind, search: cmdSearch, dedup: cmdDedup, recall: cmdRecall, box: cmdBox, summon: cmdSummon, sweep: cmdSweep,
+    score: cmdScore, stats: cmdStats,
+    trees: cmdTrees, tree: cmdTree, plaque: cmdPlaque, share: cmdShare, forest: cmdForest, status: cmdStatus,
     candidates: cmdCandidates, synthesize: cmdSynthesize, unsynthesize: cmdUnsynthesize,
     waiting: cmdWaiting, need: cmdNeed, dream: cmdDream,
     config: cmdConfig, grow: cmdGrow, plant: cmdPlant, index: cmdIndex, auto: cmdAuto,
+    events: cmdEvents,
     tip: cmdTip, use: cmdUse, finish: cmdFinish, unfinish: cmdUnfinish,
     'plant-branch': cmdPlantBranch, recycle: cmdRecycle, 'plant-project': cmdPlantProject,
   };

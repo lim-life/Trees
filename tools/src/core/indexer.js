@@ -47,7 +47,11 @@ export async function renderIndex(opts = {}) {
   if (trees.length) {
     lines.push('', '## 大树');
     for (const t of trees) {
-      lines.push(`- ${t.id} ${t.title} (${(t.branches || []).length} 分支 / ${(t.seeds || []).length} 种子)`);
+      // 规则 8：列表只显示树牌，不展开正文
+      const plaque = t.plaque || t.title;
+      const labels = (t.labels || []).join(', ');
+      const planter = t.planter ? ` · ${t.planter}` : '';
+      lines.push(`- ${t.id} ${plaque}${labels ? ` — ${labels}` : ''}${planter} (${(t.branches || []).length} 分支 / ${(t.seeds || []).length} 种子)`);
     }
   }
 

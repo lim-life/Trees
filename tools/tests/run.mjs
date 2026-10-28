@@ -617,6 +617,257 @@ const throws = async (fn) => {
   t('auto: 写了回写日志', (await readFile(logPath, 'utf8').catch(() => '')).includes('session'));
 }
 
+// ───────────────────────── Phase 1: 身份 / 事件账本 / 证据 / 材料 ─────────────────────────
+{
+  const { writeConfig } = await import('../src/core/config.js');
+  const events = await import('../src/core/events.js');
+  const plant = await import('../src/core/plant.js');
+  const { scoreSeed } = await import('../src/core/recall.js');
+  const { mkdir: mk, writeFile: wf, readFile: rf } = await import('node:fs/promises');
+
+  await writeConfig({ planter: 'tester' });
+
+  const s = await seed.createSeed({
+    title: 'planter 与证据字段', labels: ['x'], criteria: 'c', method: 'm', notApplicable: 'n',
+    evidence_level: 'L2', external_ids: { doi: '10.1/x' }, derived_from: ['seed-0001'],
+  });
+  t('phase1: planter 从配置注入', s.planter === 'tester');
+  t('phase1: 证据字段落盘', s.evidence_level === 'L2'
+    && s.external_ids.doi === '10.1/x' && s.derived_from.length === 1);
+
+  const back = await seed.readSeed(s.id);
+  t('phase1: 证据字段磁盘往返', back.external_ids.doi === '10.1/x' && back.planter === 'tester');
+  const objRt = parse(stringify({ external_ids: { doi: '10.1/x' }, empty: {} }, '')).data;
+  t('phase1: 嵌套对象往返', objRt.external_ids.doi === '10.1/x'
+    && Object.keys(objRt.empty).length === 0);
+  t('phase1: 非法证据等级回落 L0',
+    (await seed.createSeed({ title: 'bad level', evidence_level: 'L9' })).evidence_level === 'L0');
+
+  const ev1 = await events.listEvents({});
+  t('phase1: 播种写事件',
+    ev1.some((e) => e.type === 'plant' && e.seed === s.id && e.actor === 'tester'));
+
+  await seed.waterSeed(s.id, true);
+  await seed.waterSeed(s.id, false);
+  const ev2 = await events.listEvents({ seed: s.id });
+  t('phase1: 浇水/失败写事件',
+    ev2.some((e) => e.type === 'water') && ev2.some((e) => e.type === 'fail'));
+
+  const chainOk = await events.verifyEvents();
+  t('phase1: 账本哈希链完整',
+    chainOk.ok && chainOk.chained > 0 && /^[a-f0-9]{64}$/.test(chainOk.head));
+
+  const tr = await tree.createTree({
+    id: 'phase1-tree', title: '树牌测试', plaque: '一句话树牌', labels: ['a', 'b'],
+  });
+  t('phase1: 树牌与植树人',
+    tr.plaque === '一句话树牌' && tr.planter === 'tester' && tr.labels.length === 2);
+
+  // 近重复的材料优先读文档、跳过草稿
+  const dir = path.join(HOME, 'material-test');
+  await mk(path.join(dir, '_junk'), { recursive: true });
+  await wf(path.join(dir, '_junk', 'x.md'), 'JUNK');
+  await wf(path.join(dir, '_scratch.md'), 'SCRATCH');
+  await wf(path.join(dir, '需求.md'), '# 需求\n正文');
+  await wf(path.join(dir, 'code.html'), '<h1>x</h1>');
+  const got = await plant.collectMaterials(dir);
+  t('phase1: 跳过 _ 目录和 _ 文件',
+    !got.text.includes('JUNK') && !got.text.includes('SCRATCH'));
+  t('phase1: 文档优先于代码', got.files[0].endsWith('需求.md'));
+
+  // 截断自动翻倍重试
+  let calls = 0;
+  let retryTokens = 0;
+  const fakeCall = async (_messages, maxTokens) => {
+    calls++;
+    retryTokens = maxTokens;
+    if (calls === 1) throw new Error('模型输出被截断（finish_reason=length）');
+    return {
+      text: '{"tree":{"id":"retry","title":"t"},"seeds":[],"leaves":[]}',
+      usage: {}, model: 'fake',
+    };
+  };
+  const retried = await plant.extractSeeds({
+    material: 'x', source: 'x', callModel: fakeCall, maxSeeds: 1,
+  });
+  t('phase1: 截断自动翻倍重试', calls === 2 && retryTokens === 16000 && retried.tree.id === 'retry');
+
+  const plaqueModel = async () => ({
+    text: JSON.stringify({
+      tree: { id: 'plaque-test', title: 't', plaque: '一句话树牌', labels: ['a', 'b'] },
+      seeds: [], leaves: [],
+    }),
+    usage: {}, model: 'fake',
+  });
+  const withPlaque = await plant.extractSeeds({
+    material: 'x', source: 'x', callModel: plaqueModel, maxSeeds: 1,
+  });
+  t('phase1: 播种提取树牌', withPlaque.tree.plaque === '一句话树牌'
+    && withPlaque.tree.labels.join(',') === 'a,b');
+
+  // 选择性发布：只打包选中的树 + 它挂着的种子
+  const share = await import('../src/core/share.js');
+  const shareTree = await tree.createTree({
+    id: 'share-test', title: '共享测试', plaque: '只发这一棵', labels: ['share'],
+  });
+  const s1 = await seed.createSeed({ title: '共享种子一', criteria: 'c', method: 'm', notApplicable: 'n' });
+  const s2 = await seed.createSeed({ title: '共享种子二', criteria: 'c', method: 'm', notApplicable: 'n' });
+  const outsider = await seed.createSeed({ title: '不该发布', criteria: 'c', method: 'm', notApplicable: 'n' });
+  await tree.linkSeed(shareTree.id, s1.id);
+  await tree.linkSeed(shareTree.id, s2.id);
+
+  const bundle = await share.shareTree(shareTree.id);
+  const manifest = JSON.parse(await rf(path.join(bundle.dir, 'manifest.json'), 'utf8'));
+  t('phase1: 发布包只含这棵树的种子', manifest.seeds.length === 2
+    && manifest.seeds.every((s) => s.id !== outsider.id));
+  t('phase1: 每个文件都有 sha256', /^[a-f0-9]{64}$/.test(manifest.tree.sha256)
+    && manifest.seeds.every((s) => /^[a-f0-9]{64}$/.test(s.sha256)));
+  t('phase1: 树与种子标为 shared',
+    (await tree.readTree(shareTree.id)).visibility === 'shared'
+    && (await seed.readSeed(s1.id)).visibility === 'shared');
+  t('phase1: 未选中的种子仍是 private',
+    (await seed.readSeed(outsider.id)).visibility === 'private');
+
+  // 规则 7：自己的种子权重更高，但只是排序，不改状态
+  const own = {
+    id: 'seed-9001', title: '同名', labels: [], body: '同一段话 同一段话',
+    watered: 0, planter: 'tester', confidence: 1,
+  };
+  const other = { ...own, id: 'seed-9002', planter: 'stranger', confidence: 0.5 };
+  const a = scoreSeed(own, '同一段话', 'tester');
+  const b = scoreSeed(other, '同一段话', 'tester');
+  t('phase1: 自己的种子召回权重更高',
+    a.score > b.score && a.weight === 1 && b.weight === 0.5);
+
+  // 查重：归一化 / 精确 / 近重复 / AI 判定 / 播种时跳过
+  const dedup = await import('../src/core/dedup.js');
+  const dupBase = {
+    title: 'Windows 路径',
+    body: '## 判据\n在 MSYS 里\n\n## 做法\n用 /dev/null\n\n## 不适用\n原生 PowerShell',
+  };
+  const dupVariant = {
+    title: 'Windows 路径',
+    body: '## 判据\n在​ MSYS　里  \n\n## 做法\n用 /dev/null\n\n## 不适用\n原生 PowerShell',
+  };
+  t('phase1: 归一化忽略零宽与空白', dedup.exactHash(dupBase) === dedup.exactHash(dupVariant));
+
+  const nearA = {
+    id: 'seed-8001', title: '截图验收',
+    body: '## 判据\n需要逐页检查页面\n\n## 做法\n用无头浏览器逐页截图\n\n## 不适用\n依赖真实交互时',
+  };
+  const nearB = {
+    id: 'seed-8002', title: '截图验收方法',
+    body: '## 判据\n需要逐页检查页面效果\n\n## 做法\n用无头浏览器逐页截图并检查\n\n## 不适用\n依赖真实交互状态时',
+  };
+  const found = dedup.findDuplicates([nearA, nearB], { near: 0.5 });
+  t('phase1: 近重复能被找到', found.nearPairs.length === 1 && found.nearPairs[0].score > 0.5);
+
+  const groups = dedup.findDuplicates([dupBase, dupVariant, nearA]);
+  t('phase1: 精确重复分组', groups.exactGroups.length === 1
+    && groups.exactGroups[0].seeds.length === 2);
+
+  const judged = await dedup.judgePair(
+    { a: nearA, b: nearB },
+    async () => ({ text: '{"verdict":"same","reason":"只是换了词"}' }),
+  );
+  t('phase1: AI 判重解析', judged.verdict === 'same' && judged.reason.length > 0);
+
+  await seed.createSeed({
+    title: '重复播种测试',
+    sections: { criteria: '同一判据', method: '同一做法', not_applicable: '同一不适用' },
+  });
+  const dupModel = async () => ({
+    text: JSON.stringify({
+      tree: { id: 'dup-tree', title: 't' },
+      seeds: [{
+        title: '重复播种测试', labels: [], criteria: '同一判据',
+        method: '同一做法', notApplicable: '同一不适用',
+      }],
+      leaves: [],
+    }),
+    usage: {}, model: 'fake',
+  });
+  const plantedDup = await plant.plantFromMaterial({
+    material: 'x', source: 'x', callModel: dupModel, treeId: 'dup-tree', maxSeeds: 1,
+  });
+  t('phase1: 播种时跳过精确重复',
+    plantedDup.created.length === 0 && plantedDup.duplicatesSkipped.length === 1);
+
+  // 向量 / 内容哈希 / scorer / 统计
+  const content = await import('../src/core/content.js');
+  t('phase1: 内容哈希忽略标点与零宽',
+    content.contentHash('a', 'x，y z') === content.contentHash('a', 'x y z​'));
+
+  const vecSeed = await seed.createSeed({
+    title: '向量测试',
+    sections: { criteria: 'c', method: 'm', not_applicable: 'n' },
+    vector: { d1: 0.1, d2: 0.2, d4: 0.8, scorer: 'v1', scored_at: '2026-10-28' },
+    call_value: 0.42,
+  });
+  const vecBack = await seed.readSeed(vecSeed.id);
+  t('phase1: 向量与 D3 落盘',
+    vecBack.vector.d1 === 0.1 && vecBack.vector.d4 === 0.8
+    && vecBack.call_value === 0.42 && /^[a-f0-9]{64}$/.test(vecBack.content_hash));
+
+  const scorer = await import('../src/core/scorer.js');
+  let scoreCalls = 0;
+  const fakeScore = async () => {
+    scoreCalls++;
+    return { text: '{"d1":0.1,"d2":0.2,"d3":0.6,"d4":0.9}', model: 'fake-scorer' };
+  };
+  const score1 = await scorer.scoreText('唯一内容 A', { callModel: fakeScore });
+  const score2 = await scorer.scoreText('唯一内容 A', { callModel: fakeScore });
+  t('phase1: scorer 解析与缓存',
+    score1.d1 === 0.1 && score1.d4 === 0.9 && scoreCalls === 1 && score2.d3 === 0.6);
+
+  const scored = await scorer.scoreSeed(vecSeed.id, {
+    force: true,
+    callModel: async () => ({ text: '{"d1":0.2,"d2":0.3,"d3":0.4,"d4":0.5}', model: 'fake' }),
+  });
+  t('phase1: scoreSeed 写回向量',
+    scored.seed.vector.d1 === 0.2 && scored.seed.call_value === 0.4);
+
+  const stats = await import('../src/core/stats.js');
+  const report = stats.summarize({
+    seeds: [{ id: 's1', state: 'buried', watered: 2, failed: 1, planter: 'p', title: 't' }],
+    trees: [{}],
+    events: [{ type: 'plant', seed: 's1' }, { type: 'water', seed: 's1' }],
+  });
+  t('phase1: 统计由本地数据算出',
+    report.seeds.total === 1 && report.events.byType.water === 1 && report.perSeed.s1.used === 1);
+
+  // 检索空间：查询计划 + 四维过滤 + 文本召回
+  const space = await import('../src/core/space.js');
+  const plan = space.parsePlan('{"keywords":["geth","私链"],"d2_max":0.3,"d4_max":0.2}');
+  t('phase1: 查询计划解析', plan.keywords.includes('geth') && plan.d2_max === 0.3 && plan.source === 'model');
+
+  const geth = {
+    id: 'seed-7001', title: 'Geth 私链初始化', body: '## 判据\n搭私链\n\n## 做法\ngeth init genesis.json\n\n## 不适用\n无',
+    vector: { d1: 0.1, d2: 0, d4: 0.1 }, call_value: 0.5, watered: 2,
+  };
+  const art = {
+    id: 'seed-7002', title: '水彩上色', body: '## 判据\n画画\n\n## 做法\n先浅后深\n\n## 不适用\n无',
+    vector: { d1: 0.8, d2: 0.9, d4: 0 }, call_value: 0.5, watered: 2,
+  };
+  const hit = space.searchSeeds('搭一条 geth 私链', [geth, art], { plan, limit: 5 });
+  t('phase1: 四维过滤 + 文本召回', hit.results.length === 1 && hit.results[0].id === 'seed-7001');
+
+  const planned = await space.planQuery('画画', {
+    callModel: async () => ({ text: '{"keywords":["水彩"],"d2_min":0.8,"d2_max":1,"d4_max":0.1}' }),
+  });
+  t('phase1: planQuery 调用管理模型', planned.source === 'model' && planned.keywords[0] === '水彩');
+
+  // 篡改检测：改一条字段但不重算 hash，必须被发现
+  const evFile = events.eventsPath();
+  const evLines = (await rf(evFile, 'utf8')).trimEnd().split('\n');
+  const firstEvent = JSON.parse(evLines[0]);
+  firstEvent.title = 'tampered';
+  evLines[0] = JSON.stringify(firstEvent);
+  await wf(evFile, `${evLines.join('\n')}\n`);
+  const broken = await events.verifyEvents();
+  t('phase1: 篡改可被发现', broken.ok === false && broken.brokenAt === 1);
+}
+
 console.log(log.join('\n'));
 console.log(`\n${log.length - failed}/${log.length} 通过，${failed} 失败`);
 await rm(HOME, { recursive: true, force: true });

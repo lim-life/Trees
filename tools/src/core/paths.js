@@ -1,12 +1,31 @@
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 
 /** @type {string | undefined} */
 let _forestRoot;
 
 /**
+ * 从 start 往上找「仓库根」（同时有 .git 和 forest）。
+ * 这修的是一个真实事故：在 tools/ 里跑 CLI 时，
+ * cwd/forest = tools/forest（空），配置和种子全读不到。
+ */
+function findRepoForest(start) {
+  let dir = path.resolve(start);
+  for (let i = 0; i < 8; i++) {
+    if (existsSync(path.join(dir, '.git')) && existsSync(path.join(dir, 'forest'))) {
+      return path.join(dir, 'forest');
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+/**
  * 获取森林根目录的绝对路径。
- * 读取环境变量 TREES_HOME，若未设置则默认为当前工作目录下的 forest 文件夹。
+ * 顺序：TREES_HOME → 最近的仓库根 forest → 当前工作目录下的 forest。
  * @returns {string} 森林根目录绝对路径
  */
 export function getForestRoot() {
@@ -16,7 +35,8 @@ export function getForestRoot() {
   if (fromEnv) {
     _forestRoot = path.resolve(fromEnv);
   } else {
-    _forestRoot = path.resolve(process.cwd(), 'forest');
+    _forestRoot = findRepoForest(process.cwd())
+      ?? path.resolve(process.cwd(), 'forest');
   }
   return _forestRoot;
 }

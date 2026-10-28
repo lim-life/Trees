@@ -14,6 +14,7 @@
  */
 import { listSeeds } from './seed.js';
 import { parseSections } from './synthesize.js';
+import { getPlanter } from './config.js';
 
 /** 默认召回几颗。 */
 export const DEFAULT_LIMIT = 5;
@@ -87,7 +88,7 @@ export function estimateTokens(text) {
  * @param {string} query
  * @returns {{seed:object, score:number, textCoverage:number, titleCoverage:number, matchedLabels:string[]}}
  */
-export function scoreSeed(seed, query) {
+export function scoreSeed(seed, query, planter = '') {
   const q = tokenize(query);
   const qLower = String(query || '').toLowerCase();
   const title = tokenize(seed.title);
@@ -103,12 +104,20 @@ export function scoreSeed(seed, query) {
   const labelScore = Math.min(1, matchedLabels.length / 2);
   const seniority = Math.min(0.08, (Number(seed.watered) || 0) * 0.01);
 
+  // 规则 7：自己的树权重 1.0；别人的树按 confidence 降权。
+  // 只影响排序，不改 watered / state / last_watered。
+  const owner = String(seed.planter || '');
+  const weight = (!owner || !planter || owner === planter)
+    ? 1
+    : Math.max(0.1, Number(seed.confidence) || 0.5);
+
   return {
     seed,
-    score: 0.5 * textCoverage + 0.25 * titleCoverage + 0.18 * labelScore + seniority,
+    score: (0.5 * textCoverage + 0.25 * titleCoverage + 0.18 * labelScore + seniority) * weight,
     textCoverage,
     titleCoverage,
     matchedLabels,
+    weight,
   };
 }
 
@@ -165,8 +174,9 @@ export async function recall(query, opts = {}) {
     return { query: q, picks: [], divergent: [], tokens: 0, budget, total: all.length };
   }
 
+  const planter = await getPlanter();
   const scored = all
-    .map((s) => scoreSeed(s, q))
+    .map((s) => scoreSeed(s, q, planter))
     .filter((x) => x.score >= MIN_SCORE || x.matchedLabels.length > 0)
     .sort((a, b) => (b.score - a.score) || a.seed.id.localeCompare(b.seed.id));
 

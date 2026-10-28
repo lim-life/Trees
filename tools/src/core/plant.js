@@ -15,8 +15,9 @@
  */
 import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { createSeed, listSeeds } from './seed.js';
+import { createSeed, readSeed, listSeeds } from './seed.js';
 import { createTree, readTree, linkSeed, addBranch } from './tree.js';
+import { exactHash } from './dedup.js';
 
 /** 只读这些后缀的文件。 */
 const TEXT_EXT = new Set([
@@ -28,7 +29,16 @@ const TEXT_EXT = new Set([
 const SKIP_DIRS = new Set([
   'node_modules', '.git', 'dist', 'build', 'out', '.next', '__pycache__',
   '.venv', 'venv', 'target', 'coverage', '.cache',
+  '_pylibs', '_edgeprofile', '_epC', '_v3_browser', '_tmp_shots',
 ]);
+
+/** 材料优先级：先文档，后代码，最后杂项。 */
+const EXT_RANK = Object.freeze({
+  '.md': 0, '.markdown': 0, '.txt': 1, '.html': 2, '.css': 3,
+  '.js': 4, '.mjs': 4, '.cjs': 4, '.ts': 4, '.jsx': 4, '.tsx': 4,
+  '.py': 5, '.json': 6, '.yml': 7, '.yaml': 7, '.toml': 7,
+  '.sh': 8, '.bat': 8, '.cmd': 8, '.sql': 8,
+});
 
 /** 一次最多读多少文件、多少字节 —— 别把整个仓库塞给模型。 */
 export const MAX_FILES = 40;
@@ -55,14 +65,21 @@ export async function collectMaterials(target, opts = {}) {
     } catch {
       return;
     }
+    const base = path.basename(p);
     if (st.isDirectory()) {
-      if (SKIP_DIRS.has(path.basename(p))) {
+      // 以 _ / . 开头的是草稿、浏览器 profile、临时目录 —— 不是项目经验
+      const isDot = base.startsWith('.') && p !== path.resolve(target);
+      if (SKIP_DIRS.has(base) || base.startsWith('_') || isDot) {
         skipped.push(p);
         return;
       }
       for (const name of await readdir(p)) {
         await walk(path.join(p, name));
       }
+      return;
+    }
+    if (p !== path.resolve(target) && base.startsWith('_')) {
+      skipped.push(p);
       return;
     }
     if (!TEXT_EXT.has(path.extname(p).toLowerCase())) {
@@ -73,7 +90,12 @@ export async function collectMaterials(target, opts = {}) {
   }
 
   await walk(target);
-  files.sort();
+  // 先读文档（.md/.txt），再读代码 —— 经验通常写在文档里
+  files.sort((a, b) => {
+    const ra = EXT_RANK[path.extname(a).toLowerCase()] ?? 9;
+    const rb = EXT_RANK[path.extname(b).toLowerCase()] ?? 9;
+    return ra - rb || a.localeCompare(b);
+  });
 
   const chunks = [];
   const used = [];
@@ -83,7 +105,8 @@ export async function collectMaterials(target, opts = {}) {
   for (const f of files) {
     if (used.length >= maxFiles) { truncated = true; break; }
     const size = (await stat(f)).size;
-    if (bytes + size > maxBytes) { truncated = true; break; }
+    // 装不下就跳过这一份，继续试后面更小的 —— 别让一个 50KB 的 HTML 挡住全部材料
+    if (bytes + size > maxBytes) { truncated = true; continue; }
     try {
       const body = await readFile(f, 'utf8');
       chunks.push(`### ${f}\n\n${body}`);
@@ -115,9 +138,14 @@ function plantPrompt(material, sourceName) {
     '- `notApplicable` 不适用：什么时候别用它。**这段最重要，别偷懒** ——',
     '  抽象最容易丢的就是它，丢了它下次换个环境照搬就出事。',
     '',
+    '## 大树也要有树牌（规则 8）',
+    '- `plaque`：一句话说清这棵树解决什么问题。列表只显示它，所以要具体，不要写「一个项目」。',
+    '- `labels`：3–5 个标签，别人靠它判断要不要打开。',
+    '',
     '## 输出格式（纯 JSON，不要代码围栏，不要任何解释）',
     '',
-    '{"tree":{"id":"小写英文短横线","title":"项目名","type":"分类"},'
+    '{"tree":{"id":"小写英文短横线","title":"项目名","type":"分类",'
+    + '"plaque":"一句话说清这棵树解决什么问题","labels":["标签1","标签2"]},'
     + '"seeds":[{"title":"一句话，要具体","labels":["情境标签"],'
     + '"criteria":"判据正文","method":"做法正文","notApplicable":"不适用正文",'
     + '"evidence":"原始证据指针：哪个文件或哪次对话"}],'
@@ -150,7 +178,17 @@ function parsePlantOutput(text) {
   if (s === -1 || e === -1) throw new Error('模型没返回 JSON');
   const obj = JSON.parse(raw.slice(s, e + 1));
 
-  const tree = obj.tree && typeof obj.tree === 'object' ? obj.tree : null;
+  const tree = obj.tree && typeof obj.tree === 'object'
+    ? {
+      id: typeof obj.tree.id === 'string' ? obj.tree.id : '',
+      title: typeof obj.tree.title === 'string' ? obj.tree.title : '',
+      type: typeof obj.tree.type === 'string' ? obj.tree.type : '',
+      plaque: typeof obj.tree.plaque === 'string' ? obj.tree.plaque.trim() : '',
+      labels: Array.isArray(obj.tree.labels)
+        ? obj.tree.labels.map(String).map((x) => x.trim()).filter(Boolean)
+        : [],
+    }
+    : null;
   const seeds = Array.isArray(obj.seeds) ? obj.seeds : [];
   const leaves = Array.isArray(obj.leaves) ? obj.leaves.filter((x) => typeof x === 'string') : [];
 
@@ -218,9 +256,22 @@ export async function extractSeeds(opts) {
   const prompt = plantPrompt(opts.material, opts.source)
     + `\n\n（最多提取 ${maxSeeds} 条，宁少勿多。）`;
 
-  const res = await callModel([{ role: 'user', content: prompt }], opts.maxTokens ?? 8000);
-  const parsed = parsePlantOutput(res.text);
-  return { ...parsed, seeds: parsed.seeds.slice(0, maxSeeds), usage: res.usage ?? null };
+  // 推理模型的 reasoning_tokens 也算在 max_tokens 里：8000 经常不够。
+  // 被截断时自动翻倍重试一次，而不是把「截断」直接甩给用户。
+  let maxTokens = opts.maxTokens ?? 8000;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await callModel([{ role: 'user', content: prompt }], maxTokens);
+      const parsed = parsePlantOutput(res.text);
+      return { ...parsed, seeds: parsed.seeds.slice(0, maxSeeds), usage: res.usage ?? null };
+    } catch (error) {
+      const truncated = /finish_reason=length|截断/.test(String(error?.message || ''));
+      if (!truncated || attempt === 1) throw error;
+      maxTokens = Math.min(maxTokens * 2, 32000);
+    }
+  }
+  // 理论不可达：循环里要么返回，要么抛出
+  throw new Error('提取失败');
 }
 
 /** 把 `id` 收拾成能用的样子。 */
@@ -269,6 +320,31 @@ export async function plantFromMaterial(opts) {
     written: false,
   };
 
+  // 精确重复不进库（改标点/改格式/塞零宽字符在归一化阶段已经失效）。
+  // 近重复只提示，交给 `trees dedup --ai` 判。
+  const seen = new Map();
+  for (const existingSeed of await listSeeds({})) {
+    seen.set(exactHash(existingSeed), existingSeed.id);
+  }
+  const kept = [];
+  const duplicatesSkipped = [];
+  const reuseIds = [];
+  for (const s of extracted.seeds) {
+    const hash = exactHash({ title: s.title, body: buildPlantBody(s) });
+    if (seen.has(hash)) {
+      const owner = seen.get(hash);
+      // 库里已有同一颗：不新建，直接挂到当前树（复用，不是重复）
+      if (owner !== '本批' && !reuseIds.includes(owner)) reuseIds.push(owner);
+      duplicatesSkipped.push({ title: s.title, duplicateOf: owner, reused: owner !== '本批' });
+      continue;
+    }
+    seen.set(hash, '本批');
+    kept.push(s);
+  }
+  plan.seeds = kept;
+  plan.duplicatesSkipped = duplicatesSkipped;
+  plan.reuseIds = reuseIds;
+
   if (opts.dryRun) return plan;
 
   // ── 落盘 ──
@@ -284,6 +360,9 @@ export async function plantFromMaterial(opts) {
     id: treeId,
     title: opts.title || extracted.tree?.title || path.basename(source),
     type: opts.treeType || extracted.tree?.type || '',
+    // 树牌在播种时生成，人可随后用 `trees plaque` 改
+    plaque: opts.plaque || extracted.tree?.plaque || '',
+    labels: opts.treeLabels || extracted.tree?.labels || [],
     root_path: opts.rootPath || opts.path || source,
     ...(opts.session === true ? {
       kind: 'session',
@@ -298,7 +377,7 @@ export async function plantFromMaterial(opts) {
   if (!existing) await createTree(treeFields);
 
   const created = [];
-  for (const s of extracted.seeds) {
+  for (const s of plan.seeds) {
     const seed = await createSeed({
       title: s.title,
       labels: s.labels,
@@ -314,17 +393,27 @@ export async function plantFromMaterial(opts) {
     created.push(seed);
   }
 
+  // 复用的种子也挂到当前树；同一颗种子可以属于多棵树
+  const reused = [];
+  for (const id of plan.reuseIds) {
+    const existingSeed = await readSeed(id);
+    if (!existingSeed) continue;
+    await linkSeed(treeId, id);
+    reused.push(existingSeed);
+  }
+
   // 分支是 AI 能力画像的数据来源 —— 只知道是哪个模型播的种，也得记在树上
-  if (opts.fromBranch && created.length) {
+  const plantedIds = [...created, ...reused].map((s) => s.id);
+  if (opts.fromBranch && plantedIds.length) {
     await addBranch(treeId, {
       model: opts.fromBranch,
       role: '播种提取',
       outcome: 'good',
-      seeds_planted: created.map((s) => s.id),
+      seeds_planted: plantedIds,
     });
   }
 
-  return { ...plan, written: true, treeId, created };
+  return { ...plan, written: true, treeId, created, reused };
 }
 
 /**

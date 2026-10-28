@@ -7,6 +7,11 @@ package-lock.json
 **/forest/trees/
 **/forest/box/
 **/forest/leaves.log
+**/forest/events.jsonl
+**/forest/index.md
+**/forest/scores.json
+**/forest/publish/
+**/forest/.events.lock/
 # 里面可能有你的 API key（行内注释会让整行失效，注释必须单独一行）
 **/forest/config.json
 

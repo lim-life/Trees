@@ -2,7 +2,9 @@
 
 # 🌳 Trees
 
-> A brain-inspired ecosystem for AI experience: plant seeds, water them into trees, and the trees bear fruit on their own.
+> A forest of experience that grows on its own: projects become trees, reusable judgments become seeds. Keep them concrete; abstract only after enough reuse.
+>
+> The long-term goal: knowledge that accumulates across sessions, projects, and people — decided not by votes, but by evidence, independent reproduction, and time.
 
 A project becomes a tree; the useful things you learned become seeds. Those seeds can grow, complement one another, merge, or sit dormant until you need them again.
 
@@ -12,11 +14,15 @@ A project becomes a tree; the useful things you learned become seeds. Those seed
 
 ## Why I built this
 
-I was halfway through a project conversation when a red error appeared: the context limit was 1,048,576 tokens, and I'd sent 1,049,359—just 783 too many. The session was dead, along with everything we'd worked through.
+I was halfway through a project conversation when a red error appeared: the context limit was 1,048,576 tokens, and I'd sent 1,049,359 — just 783 too many. The session died, along with everything we'd worked through.
 
-That was a particularly abrupt version of a familiar problem. Every AI session starts over: explain the background again, hit the same pitfalls again, lose the lessons when the conversation closes. I kept stuffing more into the context because I had nowhere else to put it.
+It took me a while to see that **the context limit was a symptom, not the disease.**
 
-I wanted those lessons to survive the conversation. That's what I'm building Trees for.
+The disease is that every AI session is disposable. Background gets re-explained, the same pitfalls get hit again, and judgments that took real work disappear when the window closes. Stuffing more into the context only enlarges temporary memory; the experience still has nowhere to go.
+
+Zoom out and it gets worse: if every person's AI learns from zero, the same useful judgments get rediscovered over and over around the world. Trees is meant to be a place where experience can stay — first as a forest on your own machine, then as a shared forest where people and agents can learn along lineage, reproduce, and correct, instead of letting votes and popularity decide what is true.
+
+So the goal isn't a bigger context window. It's **putting the right few lessons in front of the model at the right moment.**
 
 ## The core idea: use it before you abstract it
 
@@ -384,30 +390,50 @@ The core is plain logic working with files. It doesn't depend on an AI framework
 
 There's still plenty here that I haven't built. Here's the boundary between working code and plans.
 
-The core data layer is done, and all 120 self-tests pass:
+The core data layer and the full session loop are working, and all 194 self-tests pass:
 
-- `frontmatter.js`: dependency-free YAML parsing and serialization, including Chinese text, colons, quotes, and arrays of objects
-- `seed.js`: seed model, state machine, watering, failure tracking, boxing and summoning, ID allocation, and handling an empty library without errors
-- `tree.js`: tree model, branches, attached seeds, and reuse notes
+- `frontmatter.js`: dependency-free YAML parsing and serialization, including Chinese text, colons, quotes, arrays of objects, and one level of nested objects
+- `seed.js`: seed model, state machine, watering, failure tracking, boxing and summoning, ID allocation, empty-library handling; `planter` identity; evidence fields (L0–L5 / external IDs / retraction / lineage)
+- `tree.js`: tree model, branches, attached seeds, reuse notes; tree plaque (`plaque` / `labels`) and planter
+- `share.js`: selective publishing — private by default, only the chosen tree is bundled; a manifest records a sha256 for every file
 - `forest.js`: forest relationships, including cycle prevention across tree clusters
 - `leaves.js`: leaf log
+- `events.js`: append-only event ledger (plant / water / fail / box / summon / tree); hash-chained, verified by `trees events --verify`
+- `dedup.js`: normalization + exact hash + near-duplicate detection; `--ai` judges semantic equivalence; exact duplicates are reused at planting time
+- `scorer.js`: one system-wide vector scorer (D1 abstraction / D2 domain / D4 risk / D3 prior), versioned and cached; never decides truth or votes
+- `stats.js`: local-only statistics (states / planters / events / usage), no model calls
+- `space.js`: retrieval space — text n-gram recall + four-dimension filtering; the manager model produces the query plan
+- `recall.js`: task description → top-k seeds + token budget + divergent list; your own trees rank highest
+- `indexer.js`: `forest/index.md`, tree plaques only
+- `session.js` / `project.js`: session chains, completion checks, merging into a project tree, first planting, rollback
 - `synthesize.js`: complementarity check, synthesis, lineage, and rollback
 - `dream.js`: the nightly loop — picks what to study, stays inside a budget, and actually studies (adds understanding, never seniority)
-- `plant.js`: extracts seeds out of a finished project, separating real lessons from busywork
+- `plant.js`: extracts seeds out of a finished project; skips scratch directories, reads docs first, retries automatically on truncation
+- `hooks/`: SessionStart injects the index and resume point; SessionEnd records automatically
 - `bin/cli.js`: every command in the command reference above
 
 Still ahead:
 
-- `health`: health checks
+- Deduplication: normalization → exact hash → MinHash → AI semantic judgment (prerequisite for the shared layer)
+- Shared-forest evidence commands: `evidence` / `retract` / `conjecture` / `resolve` / `centrality`
+- `health` / `import` / `export`
 - MCP, Skill, and standalone adapters
+- First real planting into the library (only dry runs so far)
 
 ## Roadmap
 
 1. v0.1: core data layer + CLI (done)
-2. v0.2: `plant` / `synthesize` — the full project to seed to synthesis pipeline now runs (done)
-3. v0.3: MCP adapter for direct connections from Claude Code and Cursor
-4. v0.4: the nightly loop (done — selection, budgeting, and model calls all work)
-5. v1.0: seed pack import/export, with the AI capability profile wired into task assignment
+2. v0.2: `plant` / `synthesize` — the full project to seed to synthesis pipeline (done)
+3. v0.3: session chains + recall + automatic write-back (done)
+4. v0.4: planter identity, event ledger, evidence fields, tree plaques (done)
+5. v0.5: deduplication + real planting validation + MCP adapter (in progress)
+6. v1.0: seed pack import/export, shared-forest evidence layer
+
+## Not goals for now
+
+P2P full-node network · token issuance and fundraising · global real-time sync · covering every industry at once
+
+Mechanism before network, network before currency. These aren't rejected — their order just can't be moved up. Until knowledge quality, deduplication, evidence, and retraction are validated on real use, networking would only synchronize garbage faster.
 
 ## Ground rules
 

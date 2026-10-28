@@ -11,6 +11,8 @@ import { randomUUID } from 'node:crypto';
 import { getPath, ensureDirs, listFiles } from './paths.js';
 import { parse, stringify } from './frontmatter.js';
 import { readSeed, writeSeed } from './seed.js';
+import { getPlanter } from './config.js';
+import { logEvent } from './events.js';
 
 /**
  * @typedef {object} Branch
@@ -199,6 +201,12 @@ function normalizeTree(fields) {
     created: dateField(fields.created, 'created', date),
     updated: dateField(fields.updated, 'updated', date),
     forest_id: forestId,
+    planter: stringField(fields.planter, 'planter'),
+    // 树牌（规则 8）：列表只显示它，正文按需展开
+    plaque: stringField(fields.plaque, 'plaque'),
+    labels: stringArray(fields.labels, 'labels'),
+    // 默认私有：只有显式 share 过的树才会被发布
+    visibility: fields.visibility === 'shared' ? 'shared' : 'private',
     root_path: stringField(fields.root_path, 'root_path'),
     branches: normalizedBranches,
     seeds: stringArray(fields.seeds, 'seeds'),
@@ -270,7 +278,15 @@ async function persist(tree, exclusive = false) {
  * @returns {Promise<Tree>} 实际保存的大树。
  */
 export async function createTree(fields) {
-  return mutate(async () => persist(normalizeTree(fields), true));
+  const planter = fields?.planter || await getPlanter();
+  const saved = await mutate(async () => persist(normalizeTree({ ...fields, planter }), true));
+  await logEvent('tree', {
+    actor: saved.planter || '',
+    tree: saved.id,
+    title: saved.title,
+    kind: saved.kind,
+  });
+  return saved;
 }
 
 /**

@@ -139,6 +139,7 @@ export async function chat(opts) {
         model: cfg.model,
         messages: opts.messages,
         max_tokens: opts.maxTokens ?? 4000,
+        ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
         stream,
         ...(stream ? { stream_options: { include_usage: true } } : {}),
       }),

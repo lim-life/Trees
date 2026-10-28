@@ -98,8 +98,13 @@ function stringifyYaml(data) {
         lines.push(stringifyArray(value, 2));
       }
     } else if (isObject(value)) {
+      const entries = Object.entries(value);
+      if (!entries.length) {
+        lines.push(`${key}: {}`);
+        continue;
+      }
       lines.push(`${key}:`);
-      for (const [k, v] of Object.entries(value)) {
+      for (const [k, v] of entries) {
         lines.push(`  ${k}: ${Array.isArray(v) ? stringifyArray(v, 4) : stringifyScalar(v)}`);
       }
     } else {
@@ -135,6 +140,8 @@ function parseInlineValue(raw) {
   if (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2) {
     return trimmed.slice(1, -1).replace(/''/g, "'");
   }
+  // 空对象（stringifyYaml 对空对象写 `key: {}`）
+  if (trimmed === '{}') return {};
   // 内联数组
   if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
     const inner = trimmed.slice(1, -1).trim();
@@ -237,6 +244,39 @@ function parseBlockArray(lines, startIndex) {
 }
 
 /**
+ * 解析块状对象（缩进的 `key: value` 行），目前只支持一层。
+ * 与块状数组的区别：子行不以 "- " 开头。
+ *
+ * @param {string[]} lines 所有 YAML 行
+ * @param {number} startIndex 当前顶层属性值开始的行索引
+ * @returns {{ value: object, nextIndex: number }}
+ */
+function parseBlockObject(lines, startIndex) {
+  const result = {};
+  let i = startIndex;
+  let baseIndent = null;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.trim() === '') { i++; continue; }
+    const indent = line.search(/\S/);
+    if (indent === 0) break;
+    if (baseIndent === null) baseIndent = indent;
+    if (indent < baseIndent) break;
+
+    const content = line.trim();
+    if (content.startsWith('- ')) break; // 实际是数组，交给调用方判断
+    if (content.includes(':')) {
+      const [k, v] = splitKeyValue(content);
+      result[k] = parseInlineValue(v);
+    }
+    i++;
+  }
+
+  return { value: result, nextIndex: i };
+}
+
+/**
  * 将 "键: 值" 行拆分，正确处理值内部的冒号。
  * @param {string} line
  * @returns {[string, string]}
@@ -289,10 +329,20 @@ export function parse(markdown) {
       const value = kv[1];
 
       if (value === '') {
-        // 值部分为空，意味着后续的缩进行属于块状数组
-        const { value: arrayValue, nextIndex } = parseBlockArray(lines, i + 1);
-        data[key] = arrayValue;
-        i = nextIndex;
+        // 值部分为空：后面可能是块状数组（- x），也可能是一层嵌套对象（k: v）
+        const nextLine = lines.slice(i + 1).find((line) => line.trim() !== '');
+        const isObjectBlock = Boolean(nextLine)
+          && nextLine.search(/\S/) > 0
+          && !nextLine.trimStart().startsWith('- ');
+        if (isObjectBlock) {
+          const { value: objectValue, nextIndex } = parseBlockObject(lines, i + 1);
+          data[key] = objectValue;
+          i = nextIndex;
+        } else {
+          const { value: arrayValue, nextIndex } = parseBlockArray(lines, i + 1);
+          data[key] = arrayValue;
+          i = nextIndex;
+        }
       } else {
         // 内联值
         data[key] = parseInlineValue(value);

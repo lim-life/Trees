@@ -24,6 +24,9 @@ import { randomBytes } from 'node:crypto';
 
 import { getPath, ensureDirs, listFiles } from './paths.js';
 import { parse, stringify } from './frontmatter.js';
+import { getPlanter } from './config.js';
+import { logEvent } from './events.js';
+import { contentHash } from './content.js';
 
 // ───────────────────────────── 常量 ─────────────────────────────
 
@@ -53,6 +56,18 @@ const ORIGINS = Object.freeze(['native', 'external']);
 /** 不同来源的初始置信度 */
 const DEFAULT_CONFIDENCE = Object.freeze({ native: 1.0, external: 0.5 });
 
+/** 证据阶梯：L0 猜想 … L5 外部顶级奖项（docs/03） */
+const EVIDENCE_LEVELS = Object.freeze(['L0', 'L1', 'L2', 'L3', 'L4', 'L5']);
+
+/** 猜想状态：提出 / 已解决 / 已反驳 */
+const CONJECTURE_STATES = Object.freeze(['proposed', 'resolved', 'refuted']);
+
+/** 夹到 0~1；非法值用 fallback。 */
+function clamp01(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : fallback;
+}
+
 /** 正文必备的三段标题（顺序即写入顺序） */
 const SECTION_TITLES = Object.freeze(['判据', '做法', '不适用']);
 
@@ -69,12 +84,24 @@ const FIELD_ORDER = Object.freeze([
   'last_watered',
   'from_tree',
   'from_branch',
+  'planter',
+  'visibility',
+  'content_hash',
+  'vector',
+  'call_value',
+  'call_value_updated',
   'origin',
   'confidence',
   'bloodline',
   'synthesized_into',
   'requires',
   'evidence',
+  'evidence_level',
+  'external_ids',
+  'retracted',
+  'conjecture_status',
+  'formalization',
+  'derived_from',
 ]);
 
 /** createSeed 分配 id 的最大重试次数（多 AI 并行撞号时使用） */
@@ -364,12 +391,43 @@ function normalizeSeed(raw, id, body, fallbackDate) {
     last_watered: toDateStr(raw.last_watered) ?? born,
     from_tree: toStr(raw.from_tree),
     from_branch: toStr(raw.from_branch),
+    planter: toStr(raw.planter),
+    // 默认私有：只有显式 share 过的种子才会进发布包
+    visibility: raw.visibility === 'shared' ? 'shared' : 'private',
+    // 内容身份：向量只是索引，是否同一条永远看这个哈希
+    content_hash: toStr(raw.content_hash) || contentHash(toStr(raw.title), typeof body === 'string' ? body : ''),
+    // 静态向量 D1/D2/D4（D3 是动态的，单独放 call_value）
+    vector: raw.vector && typeof raw.vector === 'object' && !Array.isArray(raw.vector)
+      ? {
+        d1: clamp01(raw.vector.d1, 0.5),
+        d2: clamp01(raw.vector.d2, 0.5),
+        d4: clamp01(raw.vector.d4, 0.1),
+        scorer: toStr(raw.vector.scorer),
+        scored_at: toStr(raw.vector.scored_at),
+      }
+      : null,
+    // D3：先验值来自 scorer，之后只由事件账本更新
+    call_value: clamp01(raw.call_value, 0.3),
+    call_value_updated: toDateStr(raw.call_value_updated) || null,
     origin,
     confidence,
     bloodline: toStrList(raw.bloodline),
     synthesized_into: synthesized || null,
     requires: toStrList(raw.requires),
     evidence: toStr(raw.evidence),
+    // 证据与血缘（docs/03 §6）：默认 L0、未撤回、无外部 ID
+    evidence_level: EVIDENCE_LEVELS.includes(String(raw.evidence_level || '').toUpperCase())
+      ? String(raw.evidence_level).toUpperCase()
+      : 'L0',
+    external_ids: raw.external_ids && typeof raw.external_ids === 'object' && !Array.isArray(raw.external_ids)
+      ? raw.external_ids
+      : {},
+    retracted: raw.retracted === true,
+    conjecture_status: CONJECTURE_STATES.includes(raw.conjecture_status)
+      ? raw.conjecture_status
+      : null,
+    formalization: toStr(raw.formalization) || null,
+    derived_from: toStrList(raw.derived_from),
     body: typeof body === 'string' ? body : '',
   };
 
@@ -581,6 +639,7 @@ export async function createSeed(fields = {}) {
   const body = typeof input.body === 'string' && input.body.trim() ? input.body : buildBody(input.sections);
   const base = normalizeSeed({ ...input, id: undefined }, '', body, todayStr());
   if (base.state !== 'boxed') base.prev_state = null;
+  if (!base.planter) base.planter = await getPlanter();
 
   for (let attempt = 0; attempt < MAX_ID_ATTEMPTS; attempt++) {
     const id = await nextId();
@@ -594,6 +653,13 @@ export async function createSeed(fields = {}) {
     try {
       // wx：文件已存在则失败 —— 同一目录内的最后一道防撞号保险
       await writeFile(fileFor(kindOf(seed.state), id), text, { encoding: 'utf8', flag: 'wx' });
+      await logEvent('plant', {
+        actor: seed.planter || '',
+        seed: id,
+        title: seed.title,
+        tree: seed.from_tree || '',
+        origin: seed.origin,
+      });
       return seed;
     } catch (err) {
       if (/** @type {{code?: string}} */ (err)?.code === 'EEXIST') continue;
@@ -725,7 +791,16 @@ export async function waterSeed(id, ok = true) {
   } else {
     next.failed += 1;
   }
-  return writeSeed(next);
+  const saved = await writeSeed(next);
+  await logEvent(ok ? 'water' : 'fail', {
+    actor: saved.planter || '',
+    seed: saved.id,
+    title: saved.title,
+    watered: saved.watered,
+    failed: saved.failed,
+    state: saved.state,
+  });
+  return saved;
 }
 
 /**
@@ -761,7 +836,9 @@ export async function boxSeed(id) {
 
   const next = { ...seed };
   applyState(next, 'boxed');
-  return writeSeed(next);
+  const saved = await writeSeed(next);
+  await logEvent('box', { actor: saved.planter || '', seed: saved.id, state: saved.state });
+  return saved;
 }
 
 /**
@@ -801,5 +878,7 @@ export async function summonSeed(id) {
   if (seed.state !== 'boxed') return seed;
 
   const restored = seed.prev_state && seed.prev_state !== 'boxed' ? seed.prev_state : DEFAULT_SUMMON_STATE;
-  return writeSeed({ ...seed, state: restored, prev_state: null });
+  const saved = await writeSeed({ ...seed, state: restored, prev_state: null });
+  await logEvent('summon', { actor: saved.planter || '', seed: saved.id, state: saved.state });
+  return saved;
 }

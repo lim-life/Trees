@@ -173,7 +173,7 @@ export async function finishProject(tipKey, opts = {}) {
       maxSeeds: opts.maxSeeds ?? 10,
       callModel: opts.callModel,
     });
-    seeds = (result.created || []).length;
+    seeds = (result.created || []).length + (result.reused || []).length;
     leaves = (result.leaves || []).length;
   } catch (err) {
     plantError = err.message;
@@ -210,7 +210,7 @@ export async function plantProject(projectId, opts = {}) {
     maxSeeds: opts.maxSeeds ?? 10,
     callModel: opts.callModel,
   });
-  return { seeds: (result.created || []).length, leaves: (result.leaves || []).length };
+  return { seeds: (result.created || []).length + (result.reused || []).length, leaves: (result.leaves || []).length };
 }
 
 /**
@@ -289,7 +289,7 @@ export async function plantBranch(key, opts = {}) {
       maxSeeds: opts.maxSeeds ?? 4,
       callModel: opts.callModel,
     });
-    seeds = (result.created || []).length;
+    seeds = (result.created || []).length + (result.reused || []).length;
   } catch (err) {
     plantError = err.message;
   }

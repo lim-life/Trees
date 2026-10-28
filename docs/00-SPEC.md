@@ -281,7 +281,7 @@ confidence: 0.5        # 初始半权重
   trees forest <child-tree> --under <parent-tree>   建森林
   trees dream [--limit N]          手动做梦
   trees health                     健康检查
-
+ 
 种子包
   trees import <包.zip>
   trees export <tree-id> -o <包.zip>
@@ -301,12 +301,16 @@ Trees\
 ├── docs\
 │   ├── 00-SPEC.md              本文件
 │   ├── 01-种子法.md
-│   └── 02-用法.md
+│   ├── 02-用法.md
+│   ├── 03-共享森林框架.md       证据阶梯 / 分层 / 先知
+│   ├── 04-联邦与防护.md         Git 联邦、选择性发布、防护顺序
+│   └── 05-代码优先架构.md        哪些由程序做，哪些才交给 AI
 ├── forest\                     ← 数据区
 │   ├── trees\
 │   ├── seeds\
 │   ├── box\
 │   ├── leaves.log
+│   ├── events.jsonl             ← 事件账本（append-only：谁在何时做了什么）
 │   └── index.md
 ├── tools\                      ← 程序区
 │   ├── package.json
