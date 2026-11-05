@@ -1,6 +1,6 @@
 {
   "name": "trees-cli",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "description": "类人脑的 AI 经验生态 —— 项目长成大树，经验结成种子。零依赖、本地优先、纯文件存储。",
   "type": "module",
   "bin": {
@@ -23,6 +23,8 @@
   "keywords": [
     "ai-agents",
     "memory",
+    "mcp",
+    "model-context-protocol",
     "knowledge-management",
     "llm",
     "second-brain",
@@ -30,14 +32,12 @@
     "zero-dependency"
   ],
   "scripts": {
-    "test": "node tests/run.mjs"
+    "test": "node tests/run.mjs",
+    "prepublishOnly": "node tests/run.mjs"
   },
   "files": [
     "bin/",
-    "src/",
-    "tests/",
-    "README.md",
-    "LICENSE"
+    "src/"
   ],
   "dependencies": {}
 }

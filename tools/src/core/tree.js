@@ -13,6 +13,7 @@ import { parse, stringify } from './frontmatter.js';
 import { readSeed, writeSeed } from './seed.js';
 import { getPlanter } from './config.js';
 import { logEvent } from './events.js';
+import { sanitizeIndex, CURATOR_SOURCES } from './plaque.js';
 
 /**
  * @typedef {object} Branch
@@ -26,6 +27,14 @@ import { logEvent } from './events.js';
  */
 
 /**
+ * @typedef {object} CoordinateIndex
+ * @property {string} domain 闭集，见 plaque.js DOMAINS。
+ * @property {string} artifact 闭集，见 plaque.js ARTIFACTS。
+ * @property {string} size 闭集，见 plaque.js SIZES。
+ * @property {Array<{seed:string, section:string}>} refs 指向种子正文的指针。
+ */
+
+/**
  * @typedef {object} Tree
  * @property {string} id
  * @property {string} title
@@ -36,6 +45,9 @@ import { logEvent } from './events.js';
  * @property {string} root_path
  * @property {Branch[]} branches
  * @property {string[]} seeds
+ * @property {string} curator_note 人写的策展备注，不参与任何计算。
+ * @property {string} curator_note_source human | model | migrated-plaque
+ * @property {CoordinateIndex|null} index 坐标牌，由 reindex 从种子重建。
  * @property {string} body Markdown 正文，不写入 frontmatter。
  */
 
@@ -193,6 +205,19 @@ function normalizeTree(fields) {
     : 'unknown';
   const kind = fields.kind === 'session' ? 'session' : 'project';
 
+  // 旧 plaque 字符串搬进 curator_note，并留下来源 —— 静默丢掉等于装没发生过
+  const legacyPlaque = typeof fields.plaque === 'string' ? fields.plaque : '';
+  const hasNote = typeof fields.curator_note === 'string' && fields.curator_note !== '';
+  const curatorNote = hasNote ? fields.curator_note : legacyPlaque;
+  const curatorNoteSource = curatorNote
+    ? (CURATOR_SOURCES.includes(fields.curator_note_source)
+      ? fields.curator_note_source
+      : (hasNote ? 'human' : 'migrated-plaque'))
+    : '';
+
+  // 盘上是扁平两键（index + index_refs），内存里合成一个对象
+  const index = sanitizeIndex(fields.index, fields.index_refs ?? fields.index?.refs);
+
   return {
     id: fields.id,
     title: stringField(fields.title, 'title'),
@@ -202,8 +227,10 @@ function normalizeTree(fields) {
     updated: dateField(fields.updated, 'updated', date),
     forest_id: forestId,
     planter: stringField(fields.planter, 'planter'),
-    // 树牌（规则 8）：列表只显示它，正文按需展开
-    plaque: stringField(fields.plaque, 'plaque'),
+    // 规则 8：列表只显示坐标牌。牌是种子的投影（指针），不是摘要
+    index,
+    curator_note: curatorNote,
+    curator_note_source: curatorNoteSource,
     labels: stringArray(fields.labels, 'labels'),
     // 默认私有：只有显式 share 过的树才会被发布
     visibility: fields.visibility === 'shared' ? 'shared' : 'private',
@@ -242,7 +269,24 @@ async function persist(tree, exclusive = false) {
   const directory = getPath('trees');
   const destination = path.join(directory, `${tree.id}.md`);
   const temporary = path.join(directory, `.${tree.id}.${randomUUID()}.tmp`);
-  const { body, ...data } = tree;
+
+  // frontmatter 只支持一层嵌套，所以坐标牌拆成扁平两键写出；
+  // 按键遍历保证每次写盘的字段顺序一致（逐字节重建的前提）。
+  const data = {};
+  for (const [key, value] of Object.entries(tree)) {
+    if (key === 'body') continue;
+    if (key === 'index') {
+      data.index = value
+        ? { domain: value.domain, artifact: value.artifact, size: value.size }
+        : null;
+      data.index_refs = value
+        ? value.refs.map((ref) => ({ seed: ref.seed, section: ref.section }))
+        : [];
+      continue;
+    }
+    data[key] = value;
+  }
+  const { body } = tree;
 
   try {
     await writeFile(temporary, stringify(data, body), {
@@ -312,16 +356,19 @@ export async function readTree(id) {
 }
 
 /**
- * 写回大树，自动将 updated 更新为本地今天，不修改传入对象。
+ * 写回大树，默认把 updated 更新为本地今天，不修改传入对象。
  * @param {Tree} tree 大树对象。
+ * @param {{touch?:boolean}} [opts] touch=false 时保留 updated —— 重建坐标牌这类
+ *   纯派生写入不算「改动」，刷新 updated 会让逐字节重建永远失败。
  * @returns {Promise<Tree>} 实际保存的大树。
  */
-export async function writeTree(tree) {
+export async function writeTree(tree, opts = {}) {
   return mutate(async () => {
     if (!isRecord(tree)) {
       throw new TypeError('大树必须是对象');
     }
-    return persist(normalizeTree({ ...tree, updated: today() }));
+    const touch = opts.touch !== false;
+    return persist(normalizeTree({ ...tree, updated: touch ? today() : tree.updated }));
   });
 }
 

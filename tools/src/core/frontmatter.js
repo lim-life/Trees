@@ -208,7 +208,7 @@ function parseBlockArray(lines, startIndex) {
         i = nested.nextIndex;
         continue;
       }
-      if (val.includes(': ')) {
+      if (val.includes(': ') && !/^["']/.test(val)) {
         // 对象项开始：解析内联键值对，如 "- name: Alice"
         currentObj = {};
         const [k, v] = splitKeyValue(val);

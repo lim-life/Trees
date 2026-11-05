@@ -222,6 +222,13 @@ Seeds
   trees new "<title>" [--labels a,b] [--from <file.md>] [--needs "<req>"]   plant a seed by hand
   trees plant <path>               extract seeds out of a finished project (needs a model)
   trees plant <path> --dry-run     show what it would extract, write nothing
+  trees gate                       show the quarantine (rejected at the gate, not in the library)
+  trees gate --accept <n>          release one after review
+  trees mcp                        start the MCP server (how hosts call it)
+  trees mcp --show                 print what each host needs, write nothing
+  trees mcp --install <host>       write into cursor / cline / claude / codex / gemini, or all
+  trees water <id> --in <domain>   record which domain the seed was used in (defaults to the current project's)
+  trees drift                      seeds that are proving themselves outside their own domain
   trees ls [--state <state>]       list seeds
   trees show <seed-id>             show seed details
   trees water <seed-id> [--fail]   water a seed (success: +1 and advance state; --fail: record a failure, don't advance)
@@ -233,7 +240,8 @@ Seeds
 
 Trees / forests
   trees trees                      list all trees
-  trees tree <tree-id>             show one tree (including the seeds attached to it)
+  trees tree <tree-id>             show one tree (coordinate plaque and attached seeds)
+  trees reindex --all [--dry-run]  rebuild coordinate plaques from seeds (deterministic, no model)
   trees forest <child> --under <parent>   link trees together (cycles are prevented automatically)
 
 Project chains (long projects across sessions)
@@ -253,6 +261,9 @@ Distillation (distill on demand — the core of this project)
   trees need <id> --for "<req>"    declare a prerequisite (a seed id, or a description)
 
 Nightly loop (runs on its own)
+  trees nightly [--free] [--dry-run]
+                                   one pass: verify ledger → box idle seeds → score → study → rebuild plaques → refresh index
+                                   --free skips everything that costs money; this is what the scheduled task runs
   trees dream [seed-id...]         which seeds it would study tonight (plan only)
   trees dream --run                actually study them (needs a model)
   trees dream --config             show which model is configured
@@ -382,9 +393,28 @@ The core is plain logic working with files. It doesn't depend on an AI framework
 | Adapter | Who it's for | Status |
 |---|---|---|
 | CLI | Codex CLI / Gemini CLI / anything that can run a shell | Available |
-| MCP server | Claude Code / Cursor / Cline / Windsurf / Zed… | Not yet implemented |
+| MCP server | Claude Code / Cursor / Cline / Codex / Gemini / Windsurf / Zed… | **Available** |
 | Skill file | Claude Code | Not yet implemented |
 | standalone | People who bring their own LLM and use no framework at all | Not yet implemented |
+
+### MCP: make it show up in your editor
+
+```bash
+trees mcp --show                 # print what each host needs; writes nothing
+trees mcp --install cursor       # write into cursor / cline / claude / codex / gemini
+trees mcp --install all          # every host it can detect
+```
+
+It exposes **two** tools, not a wrapper around forty commands:
+
+| Tool | When the model calls it | Why only these |
+|---|---|---|
+| `recall(task)` | before starting a task | models don't call tools they don't recognise; fewer, clearer tools get used correctly |
+| `water(seed_id, ok)` | after the seed was actually used and verified | this is the only growth signal; the model gets no more write access than that |
+
+`plant` / `synthesize` / `share` are deliberately not exposed — those are human judgments.
+
+The server is **hand-written JSON-RPC, zero dependencies** — no official SDK.
 
 ## What runs today
 
@@ -394,7 +424,10 @@ The core data layer and the full session loop are working, and all 194 self-test
 
 - `frontmatter.js`: dependency-free YAML parsing and serialization, including Chinese text, colons, quotes, arrays of objects, and one level of nested objects
 - `seed.js`: seed model, state machine, watering, failure tracking, boxing and summoning, ID allocation, empty-library handling; `planter` identity; evidence fields (L0–L5 / external IDs / retraction / lineage)
-- `tree.js`: tree model, branches, attached seeds, reuse notes; tree plaque (`plaque` / `labels`) and planter
+- `tree.js`: tree model, branches, attached seeds, reuse notes; coordinate plaque (`index` / `labels`), curator note and planter
+- `plaque.js`: pure functions for the coordinate plaque — closed-set fields plus pointers into seed sections; no model, no clock, rebuildable byte for byte
+- `reindex.js`: rebuilds plaques from seeds; never bumps `updated`, never writes events
+- `firewall.js`: the ingestion gate — all three sections present, boundary not a platitude, not oversized, and attributable to a model. Code decides; rejected candidates go to `forest/quarantine/`, never deleted
 - `share.js`: selective publishing — private by default, only the chosen tree is bundled; a manifest records a sha256 for every file
 - `forest.js`: forest relationships, including cycle prevention across tree clusters
 - `leaves.js`: leaf log
@@ -404,7 +437,7 @@ The core data layer and the full session loop are working, and all 194 self-test
 - `stats.js`: local-only statistics (states / planters / events / usage), no model calls
 - `space.js`: retrieval space — text n-gram recall + four-dimension filtering; the manager model produces the query plan
 - `recall.js`: task description → top-k seeds + token budget + divergent list; your own trees rank highest
-- `indexer.js`: `forest/index.md`, tree plaques only
+- `indexer.js`: `forest/index.md` — coordinate plaques only, seed sections resolved at render time
 - `session.js` / `project.js`: session chains, completion checks, merging into a project tree, first planting, rollback
 - `synthesize.js`: complementarity check, synthesis, lineage, and rollback
 - `dream.js`: the nightly loop — picks what to study, stays inside a budget, and actually studies (adds understanding, never seniority)

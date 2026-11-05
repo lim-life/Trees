@@ -108,7 +108,7 @@ Trees（按需抽象）      项目完成 → 播种，保持具体
 | 森林 Forest | 强关联的项目树群（`forest_id` 指向父树） | 写在 tree 里 |
 | 分支 Branch | 树上多个 AI 的贡献区，用来积累 AI 能力画像 | 写在 tree 里 |
 | 植树人 Planter | 种下这棵树的人。自己的树召回权重最高，别人的按 `confidence` 降权 | 写在 seed / tree 里 |
-| 树牌 Plaque | 一句话总结 + 标签。看别人的树先看树牌，需要才打开正文 | 写在 tree 里 |
+| 坐标牌 Index | 由种子投影出来的索引：闭集领域/产出物/规模 + 指向种子「判据」「不适用」的**指针**。不含任何自由文本，可从原件逐字节重建；人写的 `curator_note` 不参与计算 | 写在 tree 里 |
 
 共享森林的层级、证据阶梯与两类先知见 [docs/03-共享森林框架.md](docs/03-共享森林框架.md)。
 
@@ -236,6 +236,13 @@ seeds: ["seed-0001"]
   trees new "<标题>" [--labels a,b] [--from <文件.md>] [--needs "<前置>"]   手动播种一颗种子
   trees plant <项目路径>           从做完的项目里提取种子（要配模型）
   trees plant <路径> --dry-run     只看看会提出什么，不落盘
+  trees gate                       看隔离区（被闸门拦下、还没进库的种子）
+  trees gate --accept <序号>        复核后放行一条
+  trees mcp                        起 MCP 服务（宿主会这么调它）
+  trees mcp --show                 打印各宿主该配的片段，什么都不写
+  trees mcp --install <宿主>       自动写进 cursor / cline / claude / codex / gemini，或 all
+  trees water <id> --in <领域>     记下这次在哪个领域用上的（默认取当前项目树的领域）
+  trees drift                      哪些种子正在跨域生效 —— 新方向，还是分类改错了
   trees ls [--state <状态>]        列出种子
   trees show <seed-id>             看种子详情
   trees water <seed-id> [--fail]   浇水（成功 +1 并推进状态；--fail 记失败且不推进）
@@ -247,7 +254,8 @@ seeds: ["seed-0001"]
 
 大树 / 森林
   trees trees                      列出所有大树
-  trees tree <tree-id>             看一棵树（含挂在它下面的种子）
+  trees tree <tree-id>             看一棵树（含坐标牌和挂在它下面的种子）
+  trees reindex --all [--dry-run]  从种子重建坐标牌（确定性，不用模型）
   trees forest <子树> --under <父树>   建强关联（自动防环）
 
 项目链（长项目跨会话）
@@ -260,6 +268,9 @@ seeds: ["seed-0001"]
   trees plant-project <proj-id>    重新播种一个项目
 
 黑夜循环（系统自跑）
+  trees nightly [--free] [--dry-run]
+                                   一次跑完：账本校验 → 入盒 → 补分 → 学习 → 坐标牌 → 目录
+                                   --free 跳过所有花钱的步骤；定时任务跑的就是它
   trees dream [seed-id...]         今晚该学哪几颗（只出计划，不花钱）
   trees dream --run                真去学（要配模型）
   trees dream --config             看现在配的是哪个模型
@@ -385,9 +396,28 @@ trees grow --uninstall     # 卸掉
 | 接入 | 给谁用 | 状态 |
 |---|---|---|
 | CLI | Codex CLI / Gemini CLI / 任何能跑 shell 的 | 已可用 |
-| MCP 服务器 | Claude Code / Cursor / Cline / Windsurf / Zed… | 未实现 |
+| MCP 服务器 | Claude Code / Cursor / Cline / Codex / Gemini / Windsurf / Zed… | **已可用** |
 | Skill 文件 | Claude Code | 未实现 |
 | standalone | 自带 LLM、一个框架都不用的人 | 未实现 |
+
+### MCP：让它出现在你的编辑器里
+
+```bash
+trees mcp --show                 # 打印各宿主该配什么，什么都不写
+trees mcp --install cursor       # 自动写进 cursor / cline / claude / codex / gemini
+trees mcp --install all          # 检测到的宿主全装一遍
+```
+
+只暴露**两个**工具，不是四十个命令的包装：
+
+| 工具 | 什么时候调 | 为什么只有它 |
+|---|---|---|
+| `recall(task)` | 接任务之前 | 模型不会主动调用一个它不认识的工具，工具越少越容易被用对 |
+| `water(seed_id, ok)` | 真的用过并验证之后 | 这是唯一的成长信号，不能给模型更多权限 |
+
+`plant` / `synthesize` / `share` 一律不暴露 —— 那些是人的判断，不是模型的。
+
+服务器是**手写的 JSON-RPC，零依赖**，不用官方 SDK。
 
 ## 现在能跑什么，还欠什么
 
@@ -397,7 +427,9 @@ trees grow --uninstall     # 卸掉
 
 - `frontmatter.js`：零依赖的 YAML 解析和序列化，正确处理中文、冒号、引号、对象数组和一层嵌套对象
 - `seed.js`：种子模型，状态机、浇水、失败记录、入盒/召唤、id 分配；`planter` 身份；证据字段（L0–L5 / 外部 ID / 撤回 / 血缘）
-- `tree.js`：大树模型，分支、挂载种子、复用说明；树牌 `plaque` / `labels` / 植树人
+- `tree.js`：大树模型，分支、挂载种子、复用说明；坐标牌 `index` / `labels` / 备注 / 植树人
+- `plaque.js`：坐标牌的纯函数 —— 闭集字段 + 指向种子段落的指针；不用模型、不看时间，可逐字节重建
+- `reindex.js`：从种子重建坐标牌；不刷新 `updated`，不写事件账本
 - `share.js`：选择性发布 —— 默认私有，只打包选中的树；manifest 记录每个文件的 sha256
 - `forest.js`：森林关系，树群之间自动防环
 - `leaves.js`：落叶日志
@@ -407,10 +439,13 @@ trees grow --uninstall     # 卸掉
 - `stats.js`：纯本地统计（状态/植树人/事件/调用），不调模型
 - `space.js`：检索空间 —— 文本 n-gram 召回 + 四维过滤；管理 AI 出查询计划
 - `recall.js`：任务描述 → top-k 种子 + token 预算 + 发散列表；自己的树权重最高
-- `indexer.js`：`forest/index.md`，只显示树牌
+- `indexer.js`：`forest/index.md`，只显示坐标牌，种子段落渲染时才展开
 - `session.js` / `project.js`：会话链、完成判定、合并成项目大树、首次播种、回拆
 - `synthesize.js`：互补判定 + 合成 + 血统 + 回拆
 - `dream.js`：黑夜循环 —— 挑该学的种子、守预算、真去学（只补见识，不涨资历）
+- `nightly.js`：夜间维护链 —— 账本校验 / 入盒 / 补分 / 学习 / 坐标牌 / 目录，每步独立兜底、每步有上限
+- `firewall.js`：入库闸门 —— 三段齐全 / 边界非空话 / 不过长 / 必须署名，全部由代码判定；被拒进隔离区不删除
+- `schedule/grow.js`：把夜间维护链装成 Windows 计划任务或 crontab，可预览、可卸载
 - `plant.js`：从做完的项目里提取种子；跳过草稿目录、文档优先、截断自动重试
 - `hooks/`：SessionStart 注入索引与接续点，SessionEnd 自动记录
 - `bin/cli.js`：前面命令表里的全部命令

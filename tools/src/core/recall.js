@@ -12,9 +12,11 @@
  * 预算：默认最多 5 颗、4000 token。超出预算的种子宁可不召回，
  * 也不能把上下文重新撑满 —— 那正是这个项目要解决的问题。
  */
-import { listSeeds } from './seed.js';
+import { listSeeds, readSeed } from './seed.js';
 import { parseSections } from './synthesize.js';
 import { getPlanter } from './config.js';
+import { classifyDomain } from './plaque.js';
+import { freshShards } from './shard.js';
 
 /** 默认召回几颗。 */
 export const DEFAULT_LIMIT = 5;
@@ -88,7 +90,7 @@ export function estimateTokens(text) {
  * @param {string} query
  * @returns {{seed:object, score:number, textCoverage:number, titleCoverage:number, matchedLabels:string[]}}
  */
-export function scoreSeed(seed, query, planter = '') {
+export function scoreSeed(seed, query, planter = '', opts = {}) {
   const q = tokenize(query);
   const qLower = String(query || '').toLowerCase();
   const title = tokenize(seed.title);
@@ -111,13 +113,37 @@ export function scoreSeed(seed, query, planter = '') {
     ? 1
     : Math.max(0.1, Number(seed.confidence) || 0.5);
 
+  // 领域系数 = 先验 + 实证，**不是判决**。
+  //
+  // 先验：声明领域相符 1.0，不符 0.75 —— 只是个起点。
+  // 实证：在这颗种子在当前领域里被浇水验证过几次。用过就往上抬，成功越多抬得越多，
+  //       失败过就往下压。所以一颗标着 other 的种子，在 web 里被验证三次，
+  //       权重会超过一颗标着 web 但一次没用过的种子。
+  //
+  // 为什么必须这样：标签可能分错、可能缺失。如果只看标签，一次误分类就是永久惩罚。
+  // 系统里不允许出现「永远」。
+  const queryDomain = opts.domain || '';
+  const sameDomain = Boolean(queryDomain) && seed.domain === queryDomain;
+  const stats = (opts.domainStats || {})[queryDomain] || {};
+  const usedHere = Number(stats.w) || 0;
+  const failedHere = Number(stats.f) || 0;
+
+  let domainWeight = !queryDomain ? 1 : (sameDomain ? 1 : 0.75);
+  if (usedHere) domainWeight = Math.min(1.25, domainWeight + 0.1 * Math.min(usedHere, 4));
+  if (failedHere) domainWeight *= Math.max(0.5, 1 - 0.12 * failedHere);
+
   return {
     seed,
-    score: (0.5 * textCoverage + 0.25 * titleCoverage + 0.18 * labelScore + seniority) * weight,
+    score: (0.5 * textCoverage + 0.25 * titleCoverage + 0.18 * labelScore + seniority)
+      * weight * domainWeight,
     textCoverage,
     titleCoverage,
     matchedLabels,
     weight,
+    sameDomain,
+    domainWeight,
+    domainUses: usedHere,
+    domainFailed: failedHere,
   };
 }
 
@@ -148,8 +174,14 @@ export function compactBody(body, maxTokens) {
 function renderSeed(item, maxTokens) {
   const { seed } = item;
   const body = compactBody(seed.body, maxTokens).replace('<id>', seed.id);
+  // 同域/跨域写在头上 —— 跨域的那几颗很可能是「换个场景才成立的」，
+  // 用之前必须自己判断它的「不适用」是不是正好命中当前环境。
+  let tier;
+  if (item.sameDomain) tier = '同域';
+  else if (item.domainUses > 0) tier = `跨域·来自 ${seed.domain || 'other'}，本域已用过 ${item.domainUses} 次`;
+  else tier = `跨域·来自 ${seed.domain || 'other'}`;
   return [
-    `### ${seed.id} ${seed.title}`,
+    `### ${seed.id} ${seed.title}  〔${tier}〕`,
     `状态 ${seed.state} · 浇水 ${seed.watered} · 标签 [${(seed.labels || []).join(', ')}]`,
     body,
   ].join('\n');
@@ -162,21 +194,88 @@ function renderSeed(item, maxTokens) {
  * @param {{limit?:number, budget?:number, includeBoxed?:boolean, divergent?:number}} [opts]
  * @returns {Promise<{query:string, picks:Array, divergent:Array, tokens:number, budget:number, total:number}>}
  */
+/** 把任务描述切成领域分类用的词元。 */
+function queryTerms(q) {
+  const parts = String(q).split(/[^\p{L}\p{N}_]+/u).filter(Boolean);
+  return parts.length ? parts : [String(q)];
+}
+
+/**
+ * 阶段一：只在索引上粗排，把候选读进内存。
+ * 不读正文 —— 这正是它比全库扫描便宜的原因。
+ *
+ * @param {object} shards freshShards() 的结果
+ * @param {string} q
+ * @param {boolean} includeBoxed
+ * @param {number} limit
+ * @returns {Promise<Array>} 读出来的种子（数量 ≈ limit×6，最少 20）
+ */
+async function readCandidates(shards, q, includeBoxed, limit) {
+  const entries = shards.entries.filter((e) => includeBoxed || e.state !== 'boxed');
+  const qTokens = tokenize(q);
+  const qLower = String(q).toLowerCase();
+  const queryDomain = classifyDomain(queryTerms(q));
+
+  const coarse = entries.map((entry) => {
+    const titleCov = coverage(qTokens, tokenize(entry.title));
+    const matched = (entry.labels || []).filter((label) => qLower.includes(String(label).toLowerCase()));
+    const labelScore = Math.min(1, matched.length / 2);
+    const sameBonus = entry.domain === queryDomain ? 0.12 : 0;
+    return { entry, score: 0.6 * titleCov + 0.4 * labelScore + sameBonus };
+  }).sort((a, b) => (b.score - a.score) || a.entry.id.localeCompare(b.entry.id));
+
+  const take = Math.max(20, limit * 6);
+  const seeds = [];
+  for (const { entry } of coarse.slice(0, take)) {
+    try {
+      const seed = await readSeed(entry.id);
+      if (seed) seeds.push(seed);
+    } catch {
+      // 单个种子坏了不该让整次召回失败
+    }
+  }
+  return seeds;
+}
+
 export async function recall(query, opts = {}) {
   const q = String(query || '').trim();
   const limit = opts.limit ?? DEFAULT_LIMIT;
   const budget = opts.budget ?? DEFAULT_BUDGET;
   const includeBoxed = opts.includeBoxed ?? false;
   const divergentCount = opts.divergent ?? DEFAULT_DIVERGENT;
-  const all = (await listSeeds({})).filter((s) => includeBoxed || s.state !== 'boxed');
+
+  // 先问「这个任务属于哪个领域」，再看索引还在不在。
+  const queryDomain = classifyDomain(queryTerms(q));
+
+  // 两阶段：有新鲜索引就只在索引上粗排，只把候选读进内存；索引不可用就退回全库扫描。
+  const shards = await freshShards();
+  let all;
+  let scanned = 0;
+  if (shards) {
+    all = await readCandidates(shards, q, includeBoxed, limit);
+    scanned = all.length;
+  } else {
+    all = (await listSeeds({})).filter((s) => includeBoxed || s.state !== 'boxed');
+    scanned = all.length;
+  }
 
   if (!q) {
-    return { query: q, picks: [], divergent: [], tokens: 0, budget, total: all.length };
+    return {
+      query: q, picks: [], divergent: [], tokens: 0, budget, total: all.length, domain: queryDomain,
+    };
   }
 
   const planter = await getPlanter();
+  // 领域实证来自索引；没有索引时退回「只有先验」，而不是假装有数据
+  const statsById = shards
+    ? new Map(shards.entries.map((e) => [e.id, e.domain_stats || {}]))
+    : new Map();
+
   const scored = all
-    .map((s) => scoreSeed(s, q, planter))
+    .map((s) => scoreSeed(s, q, planter, {
+      domain: queryDomain,
+      domainStats: statsById.get(s.id),
+    }))
     .filter((x) => x.score >= MIN_SCORE || x.matchedLabels.length > 0)
     .sort((a, b) => (b.score - a.score) || a.seed.id.localeCompare(b.seed.id));
 
@@ -209,7 +308,17 @@ export async function recall(query, opts = {}) {
     divergent.push(...filler);
   }
 
-  return { query: q, picks, divergent, tokens: used, budget, total: all.length };
+  return {
+    query: q,
+    picks,
+    divergent,
+    tokens: used,
+    budget,
+    total: all.length,
+    domain: queryDomain,
+    indexed: Boolean(shards),
+    scanned,
+  };
 }
 
 /**
@@ -222,7 +331,7 @@ export function renderRecall(result) {
     return `## Trees 相关经验\n\n没有命中任何种子（库内 ${result.total} 颗）。`;
   }
   const lines = [
-    `## Trees 相关经验（${result.picks.length} 颗，约 ${result.tokens} / ${result.budget} token）`,
+    `## Trees 相关经验（${result.picks.length} 颗，约 ${result.tokens} / ${result.budget} token${result.domain ? ` · 当前领域 ${result.domain}` : ''}）`,
     '',
   ];
   for (const p of result.picks) lines.push(p.text, '');

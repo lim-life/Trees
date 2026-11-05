@@ -59,9 +59,13 @@ export function buildGrowPlan(opts = {}) {
     const wrapperPath = path.join(dir, 'grow.cmd');
     const wrapper = [
       '@echo off',
+      // 文件是 UTF-8，但 cmd.exe 默认按系统代码页（简体中文是 GBK）读批处理，
+      // 中文路径会被吃成乱码（F:\项目 → F:\椤圭洰）。先切到 UTF-8 再执行后面的行。
+      'chcp 65001 > nul',
       'rem 由 trees grow --install 生成，卸载会一并删掉',
       `set "TREES_HOME=${treesHome}"`,
-      `"${nodePath}" "${cliPath}" dream --run >> "${logPath}" 2>&1`,
+      // 跑整条夜间维护链：账本校验 → 入盒 → 补分 → 学习 → 坐标牌 → 目录
+      `"${nodePath}" "${cliPath}" nightly >> "${logPath}" 2>&1`,
       '',
     ].join('\r\n');
     return {
@@ -82,7 +86,7 @@ export function buildGrowPlan(opts = {}) {
   const wrapper = [
     '#!/bin/sh',
     '# 由 trees grow --install 生成，卸载会一并删掉',
-    `TREES_HOME="${treesHome}" exec "${nodePath}" "${cliPath}" dream --run >> "${logPath}" 2>&1`,
+    `TREES_HOME="${treesHome}" exec "${nodePath}" "${cliPath}" nightly >> "${logPath}" 2>&1`,
     '',
   ].join('\n');
   return {

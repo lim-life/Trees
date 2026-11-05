@@ -15,8 +15,11 @@
  */
 import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { getForestRoot } from './paths.js';
+import { inspect, quarantine, recordWarnings } from './firewall.js';
 import { createSeed, readSeed, listSeeds } from './seed.js';
 import { createTree, readTree, linkSeed, addBranch } from './tree.js';
+import { reindexTree } from './reindex.js';
 import { exactHash } from './dedup.js';
 
 /** 只读这些后缀的文件。 */
@@ -67,6 +70,12 @@ export async function collectMaterials(target, opts = {}) {
     }
     const base = path.basename(p);
     if (st.isDirectory()) {
+      // 数据区不是材料：播自己的仓库时，forest/ 里全是已有的种子和大树，
+      // 读进来等于拿种子提取种子。只跳过真正的那一个 forest 根，不按名字误伤别人的目录。
+      if (path.resolve(p) === path.resolve(getForestRoot())) {
+        skipped.push(p);
+        return;
+      }
       // 以 _ / . 开头的是草稿、浏览器 profile、临时目录 —— 不是项目经验
       const isDot = base.startsWith('.') && p !== path.resolve(target);
       if (SKIP_DIRS.has(base) || base.startsWith('_') || isDot) {
@@ -138,14 +147,15 @@ function plantPrompt(material, sourceName) {
     '- `notApplicable` 不适用：什么时候别用它。**这段最重要，别偷懒** ——',
     '  抽象最容易丢的就是它，丢了它下次换个环境照搬就出事。',
     '',
-    '## 大树也要有树牌（规则 8）',
-    '- `plaque`：一句话说清这棵树解决什么问题。列表只显示它，所以要具体，不要写「一个项目」。',
+    '## 大树备注（可选）',
+    '- `curator_note`：一句话的人写备注。**它不参与任何计算、不进列表**，'
+    + '列表显示的是从种子投影出来的坐标牌；没有值得写的一句就留空。',
     '- `labels`：3–5 个标签，别人靠它判断要不要打开。',
     '',
     '## 输出格式（纯 JSON，不要代码围栏，不要任何解释）',
     '',
     '{"tree":{"id":"小写英文短横线","title":"项目名","type":"分类",'
-    + '"plaque":"一句话说清这棵树解决什么问题","labels":["标签1","标签2"]},'
+    + '"curator_note":"一句话的人写备注，没有就空字符串","labels":["标签1","标签2"]},'
     + '"seeds":[{"title":"一句话，要具体","labels":["情境标签"],'
     + '"criteria":"判据正文","method":"做法正文","notApplicable":"不适用正文",'
     + '"evidence":"原始证据指针：哪个文件或哪次对话"}],'
@@ -183,7 +193,7 @@ function parsePlantOutput(text) {
       id: typeof obj.tree.id === 'string' ? obj.tree.id : '',
       title: typeof obj.tree.title === 'string' ? obj.tree.title : '',
       type: typeof obj.tree.type === 'string' ? obj.tree.type : '',
-      plaque: typeof obj.tree.plaque === 'string' ? obj.tree.plaque.trim() : '',
+      curator_note: typeof obj.tree.curator_note === 'string' ? obj.tree.curator_note.trim() : '',
       labels: Array.isArray(obj.tree.labels)
         ? obj.tree.labels.map(String).map((x) => x.trim()).filter(Boolean)
         : [],
@@ -341,9 +351,36 @@ export async function plantFromMaterial(opts) {
     seen.set(hash, '本批');
     kept.push(s);
   }
-  plan.seeds = kept;
+  // 闸门：判断这条算不算经验是模型做的，但**能不能进库是由代码说了算**。
+  // 被拦下的不丢，进隔离区等人复核。
+  const branch = opts.fromBranch || '';
+  const approved = [];
+  const rejected = [];
+  const warnings = [];
+  for (const s of kept) {
+    const verdict = inspect({
+      title: s.title,
+      criteria: s.criteria,
+      method: s.method,
+      notApplicable: s.notApplicable,
+      branch,
+    });
+    if (verdict.ok) {
+      approved.push(s);
+      if (verdict.warnings.length) warnings.push({ title: s.title, warnings: verdict.warnings });
+    } else {
+      rejected.push({ candidate: s, verdict });
+    }
+  }
+
+  plan.seeds = approved;
   plan.duplicatesSkipped = duplicatesSkipped;
   plan.reuseIds = reuseIds;
+  plan.rejected = rejected.map((r) => ({
+    title: r.candidate.title,
+    errors: r.verdict.errors,
+  }));
+  plan.warnings = warnings;
 
   if (opts.dryRun) return plan;
 
@@ -360,8 +397,9 @@ export async function plantFromMaterial(opts) {
     id: treeId,
     title: opts.title || extracted.tree?.title || path.basename(source),
     type: opts.treeType || extracted.tree?.type || '',
-    // 树牌在播种时生成，人可随后用 `trees plaque` 改
-    plaque: opts.plaque || extracted.tree?.plaque || '',
+    // 人写备注，不参与计算；列表显示的是下面 reindex 出来的坐标牌
+    curator_note: opts.curatorNote || extracted.tree?.curator_note || '',
+    curator_note_source: (opts.curatorNote || extracted.tree?.curator_note) ? 'model' : '',
     labels: opts.treeLabels || extracted.tree?.labels || [],
     root_path: opts.rootPath || opts.path || source,
     ...(opts.session === true ? {
@@ -402,16 +440,26 @@ export async function plantFromMaterial(opts) {
     reused.push(existingSeed);
   }
 
-  // 分支是 AI 能力画像的数据来源 —— 只知道是哪个模型播的种，也得记在树上
+  // 分支是 AI 能力画像的数据来源 —— 只知道是哪个模型播的种，也得记在树上。
+  // 不写 outcome：这时还没有任何验证，写 good 等于伪造画像数据；
+  // 留空表示「未定」，由之后的浇水/失败来填。
   const plantedIds = [...created, ...reused].map((s) => s.id);
   if (opts.fromBranch && plantedIds.length) {
     await addBranch(treeId, {
       model: opts.fromBranch,
       role: '播种提取',
-      outcome: 'good',
       seeds_planted: plantedIds,
     });
   }
+
+  // 被闸门拦下的进隔离区（不删），人可复核后放行
+  if (rejected.length) await quarantine(rejected, { tree: treeId, branch });
+
+  // 软提醒只记日志，不再逐条刷屏（见 firewall.recordWarnings）
+  await recordWarnings(plan.warnings, { tree: treeId, branch });
+
+  // 播完立刻建坐标牌（规则 8 的「播种即有」），免得目录里出现无牌大树
+  await reindexTree(treeId);
 
   return { ...plan, written: true, treeId, created, reused };
 }
@@ -424,7 +472,10 @@ export async function plantFromMaterial(opts) {
  * @returns {Promise<object>}
  */
 export async function plantFrom(opts) {
-  const collected = await collectMaterials(opts.path);
+  const collected = await collectMaterials(opts.path, {
+    maxFiles: opts.maxFiles,
+    maxBytes: opts.maxBytes,
+  });
   if (!collected.text.trim()) {
     throw new Error(`这个路径里没找到可读的文本文件：${opts.path}`);
   }

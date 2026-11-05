@@ -17,6 +17,22 @@ import { plantFromMaterial } from './plant.js';
 /** 钥匙格式：s- + 8 位无歧义字符。 */
 export const KEY_RE = /^s-[2-9A-HJ-NP-Z]{8}$/;
 
+/**
+ * 当前目录所属的项目树（顺着 .trees/last-key 找）。
+ * 浇水时用它判断「这条经验是在哪个领域被用上的」。
+ * @param {string} [cwd]
+ * @returns {Promise<object|null>}
+ */
+export async function currentProject(cwd = process.cwd()) {
+  try {
+    const key = await findLastKey(cwd);
+    if (!key) return null;
+    return await readTree(key);
+  } catch {
+    return null;
+  }
+}
+
 /** 项目链最多取多少字交给播种模型。 */
 export const MAX_CHAIN_MATERIAL = 60000;
 

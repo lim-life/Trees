@@ -4,7 +4,8 @@
  * 测试自己在系统临时目录建一个数据根，跑完清理，不碰你的 forest/。
  * 覆盖三块：frontmatter 往返、seed 状态机、tree/forest 关系与防环。
  */
-import { rm, mkdir } from 'node:fs/promises';
+import { rm, mkdir, writeFile, readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -12,6 +13,10 @@ import path from 'node:path';
 // 必须在 import 核心模块之前设好 —— paths.js 启动时读它
 const HOME = path.join(tmpdir(), `trees-selftest-${process.pid}`);
 process.env.TREES_HOME = HOME;
+// 配置也隔离到临时目录，否则测试会读到本机真实的 key（既污染测试也泄漏）
+process.env.TREES_CONFIG_HOME = path.join(HOME, 'confhome');
+process.env.TREES_RECORDED = path.join(HOME, 'recorded.json');
+delete process.env.TREES_CONFIG;
 await rm(HOME, { recursive: true, force: true });
 await mkdir(HOME, { recursive: true });
 
@@ -318,6 +323,9 @@ const throws = async (fn) => {
   t('grow: 默认时间 03:17', win.at === grow.DEFAULT_AT);
   t('grow: 任务名带「自然生长」', grow.TASK_NAME.includes('自然生长') && win.register.args.includes(grow.TASK_NAME));
   t('grow: 注册成每天一次', win.register.args.includes('/SC') && win.register.args.includes('DAILY'));
+  // 踩过：UTF-8 批处理里的中文路径被 cmd.exe 按 GBK 读成乱码，node 找不到 cli.js
+  t('grow: Windows 包装脚本先切 UTF-8，中文路径才不会变乱码',
+    win.wrapper.includes('chcp 65001') && win.wrapper.indexOf('chcp 65001') < win.wrapper.indexOf('TREES_HOME='));
   const def = grow.buildGrowPlan({ cliPath: '/x/cli.js', treesHome: '/x/forest', platform: 'linux' });
   t('grow: 默认包装脚本落在 ~/.trees 下', def.wrapperPath.includes('.trees'));
 
@@ -375,7 +383,7 @@ const throws = async (fn) => {
 
   // dry-run：一个字都不写
   const beforeCount = (await seed.listSeeds({})).length;
-  const dry = await plant.plantFrom({ path: dir, callModel: fake, dryRun: true });
+  const dry = await plant.plantFrom({ path: dir, callModel: fake, fromBranch: 'test-model', dryRun: true });
   t('plant: dry-run 提取到 1 颗种子', dry.seeds.length === 1 && dry.written === false);
   t('plant: dry-run 识别出 2 条落叶', dry.leaves.length === 2);
   t('plant: dry-run 没落盘', (await seed.listSeeds({})).length === beforeCount);
@@ -549,7 +557,15 @@ const throws = async (fn) => {
   });
   const seedReply = JSON.stringify({
     tree: { id: 'auto-proj', title: '自动项目', type: '测试' },
-    seeds: [{ title: '完成项目后的经验', labels: ['auto'], criteria: 'c', method: 'm', notApplicable: 'n', evidence: 'session' }],
+    // 闸门要求三段都写实：占位符（c / m / n）会被当成空泛边界拦下
+    seeds: [{
+      title: '会话结束时只记录不播种',
+      labels: ['auto'],
+      criteria: '长项目跨多次会话，且上一次会话还没做完时',
+      method: '结束时只建会话树，项目完成才合并并提取种子',
+      notApplicable: '一次性短任务不适用，直接做完即可；单一交付物也不需要跨会话',
+      evidence: 'session',
+    }],
     leaves: [],
   });
   // 会话归档和项目播种走同一个模型，用提示词区分
@@ -565,18 +581,18 @@ const throws = async (fn) => {
   t('auto: 太短跳过', (await auto.runAuto({ material: '短', config: cfg, cwd, minChars: 100, logPath })).skipped.includes('太短'));
 
   // 第一次会话：只记录，不播种
-  const r1 = await auto.runAuto({ material, cwd, config: cfg, minChars: 100, callModel: fakeModel('ongoing', ['还剩两页']), logPath });
+  const r1 = await auto.runAuto({ material: `${material}A`, cwd, config: cfg, minChars: 100, callModel: fakeModel('ongoing', ['还剩两页']), logPath });
   const tree1 = await tree.readTree(r1.key);
   t('session: 结束时只记录会话树', tree1?.kind === 'session' && tree1.project_status === 'ongoing');
   t('session: 未完成项目不播种', (await seed.listSeeds({ from_tree: r1.key })).length === 0);
 
   // 第二次会话自动接续
-  const r2 = await auto.runAuto({ material, cwd, config: cfg, minChars: 100, callModel: fakeModel('ongoing', ['还剩一页']), logPath });
+  const r2 = await auto.runAuto({ material: `${material}B`, cwd, config: cfg, minChars: 100, callModel: fakeModel('ongoing', ['还剩一页']), logPath });
   t('session: 自动接续上一条链', (await tree.readTree(r2.key)).continues_from === r1.key);
   t('session: 未完成不合并', (await project.evaluateChain(r2.key)).ready === false);
 
   // 第三次会话明确完成 → 合并 + 首次播种
-  const r3 = await auto.runAuto({ material, cwd, config: cfg, minChars: 100, callModel: fakeModel('complete', [], true), logPath });
+  const r3 = await auto.runAuto({ material: `${material}C`, cwd, config: cfg, minChars: 100, callModel: fakeModel('complete', [], true), logPath });
   t('project: 明确完成即可合并', (await project.evaluateChain(r3.key)).ready === true);
   const fin = await project.finishProject(r3.key, {
     id: 'proj-auto-test', fromBranch: 'fake', callModel: fakeModel('complete', [], true),
@@ -660,8 +676,9 @@ const throws = async (fn) => {
   const tr = await tree.createTree({
     id: 'phase1-tree', title: '树牌测试', plaque: '一句话树牌', labels: ['a', 'b'],
   });
-  t('phase1: 树牌与植树人',
-    tr.plaque === '一句话树牌' && tr.planter === 'tester' && tr.labels.length === 2);
+  t('phase1: 旧树牌搬进备注且与植树人共存',
+    tr.curator_note === '一句话树牌' && tr.curator_note_source === 'migrated-plaque'
+    && tr.planter === 'tester' && tr.labels.length === 2);
 
   // 近重复的材料优先读文档、跳过草稿
   const dir = path.join(HOME, 'material-test');
@@ -694,7 +711,7 @@ const throws = async (fn) => {
 
   const plaqueModel = async () => ({
     text: JSON.stringify({
-      tree: { id: 'plaque-test', title: 't', plaque: '一句话树牌', labels: ['a', 'b'] },
+      tree: { id: 'plaque-test', title: 't', curator_note: '一句话树牌', labels: ['a', 'b'] },
       seeds: [], leaves: [],
     }),
     usage: {}, model: 'fake',
@@ -702,7 +719,7 @@ const throws = async (fn) => {
   const withPlaque = await plant.extractSeeds({
     material: 'x', source: 'x', callModel: plaqueModel, maxSeeds: 1,
   });
-  t('phase1: 播种提取树牌', withPlaque.tree.plaque === '一句话树牌'
+  t('phase1: 播种提取备注', withPlaque.tree.curator_note === '一句话树牌'
     && withPlaque.tree.labels.join(',') === 'a,b');
 
   // 选择性发布：只打包选中的树 + 它挂着的种子
@@ -866,6 +883,453 @@ const throws = async (fn) => {
   await wf(evFile, `${evLines.join('\n')}\n`);
   const broken = await events.verifyEvents();
   t('phase1: 篡改可被发现', broken.ok === false && broken.brokenAt === 1);
+}
+
+// ───────────────────────── 坐标牌 ─────────────────────────
+{
+  const { mkdir: mk, writeFile: wf, readFile: rf, readdir } = await import('node:fs/promises');
+  const plaque = await import('../src/core/plaque.js');
+  const reindex = await import('../src/core/reindex.js');
+  const recallMod = await import('../src/core/recall.js');
+
+  const treesDir = path.join(HOME, 'trees');
+  await mk(treesDir, { recursive: true });
+
+  // 1. 落盘往返：扁平两键 + refs 全列
+  await tree.createTree({ id: 'index-tree', title: '坐标牌测试', type: '前端 / 网页' });
+  const a1 = await seed.createSeed({
+    title: '多页演示先定共享样式',
+    labels: ['CSS', '网页'],
+    body: '## 判据\n多页演示分人做\n\n## 做法\n先定共享变量\n\n## 不适用\n单页面',
+  });
+  const a2 = await seed.createSeed({
+    title: '验收要无头截图',
+    labels: ['验收'],
+    body: '## 判据\n要看渲染结果\n\n## 做法\n用无头浏览器截图\n\n## 不适用\n纯后端',
+  });
+  await tree.linkSeed('index-tree', a1.id);
+  await tree.linkSeed('index-tree', a2.id);
+  await reindex.reindexTree('index-tree');
+
+  const rawTree = await rf(path.join(treesDir, 'index-tree.md'), 'utf8');
+  const back = await tree.readTree('index-tree');
+  t('plaque: 落盘是扁平两键，refs 按种子顺序全列',
+    rawTree.includes('\nindex_refs:')
+    && back.index.refs.length === 4
+    && back.index.refs[0].seed === a1.id && back.index.refs[0].section === '判据'
+    && back.index.refs[1].section === '不适用'
+    && back.index.refs[2].seed === a2.id);
+
+  const provisionalBefore = plaque.isProvisional(await tree.getTreeSeeds('index-tree'));
+  await seed.waterSeed(a1.id, true);
+  const provisionalAfter = plaque.isProvisional(await tree.getTreeSeeds('index-tree'));
+  t('plaque: 浇水前算未验证，浇过就不是', provisionalBefore === true && provisionalAfter === false);
+
+  // 2. 逐字节重建
+  const snapshot = async () => {
+    const names = (await readdir(treesDir)).filter((n) => n.endsWith('.md')).sort();
+    const out = {};
+    for (const name of names) out[name] = await rf(path.join(treesDir, name), 'utf8');
+    return out;
+  };
+  await reindex.reindexAll();
+  const first = await snapshot();
+  const second = await reindex.reindexAll();
+  const again = await snapshot();
+  const identical = Object.keys(first).length === Object.keys(again).length
+    && Object.keys(first).every((name) => first[name] === again[name]);
+  t('plaque: 连跑两次逐字节一致，第二次不写盘', identical && second.updated === 0);
+
+  // 3. 引用失效
+  await tree.createTree({ id: 'orphan-tree', title: '孤儿引用' });
+  const doomed = await seed.createSeed({
+    title: '会被删掉',
+    body: '## 判据\nx\n\n## 做法\ny\n\n## 不适用\nz',
+  });
+  await tree.linkSeed('orphan-tree', doomed.id);
+  await reindex.reindexTree('orphan-tree');
+  await seed.deleteSeed(doomed.id);
+
+  const orphanTree = await tree.readTree('orphan-tree');
+  const orphanSummary = plaque.summarizeIndex(orphanTree.index, await tree.getTreeSeeds('orphan-tree'));
+  t('plaque: 种子没了只报引用失效，树仍可读',
+    orphanTree !== null && orphanSummary.includes('引用失效 2 条'));
+
+  await reindex.reindexTree('orphan-tree');
+  t('plaque: 重建后孤儿引用被剔除',
+    (await tree.readTree('orphan-tree')).index.refs.length === 0);
+
+  // 4. 畸形 index：修，不抛
+  const NL = String.fromCharCode(10);
+  await wf(path.join(treesDir, 'bad-index.md'), [
+    '---', 'id: "bad-index"', 'title: "畸形牌"',
+    'index:', '  domain: 123', '  artifact: "prototype"', '  size: "huge"',
+    'index_refs:', '  - seed: "not-a-seed"', '    section: "判据"',
+    '  - seed: "seed-0001"', '    section: "不存在"',
+    '---', '',
+  ].join(NL));
+  const bad = await tree.readTree('bad-index');
+  t('plaque: 畸形字段被修而不是让树读不出来',
+    bad !== null && bad.index.domain === 'other' && bad.index.size === 'unknown'
+    && bad.index.refs.length === 0);
+  t('plaque: 修完还能原样写回去',
+    bad !== null && (await tree.writeTree(bad)) !== null);
+
+  // 5. 旧 plaque 迁移
+  await wf(path.join(treesDir, 'legacy-plaque.md'),
+    ['---', 'id: "legacy-plaque"', 'title: "旧牌"', 'plaque: "旧树牌"', '---', ''].join(NL));
+  const legacy = await tree.readTree('legacy-plaque');
+  t('plaque: 旧 plaque 搬进备注并标来源',
+    legacy !== null && legacy.curator_note === '旧树牌'
+    && legacy.curator_note_source === 'migrated-plaque');
+  await tree.writeTree(legacy);
+  const rewritten = await rf(path.join(treesDir, 'legacy-plaque.md'), 'utf8');
+  t('plaque: 写回后文件里不再有 plaque 键',
+    !/^plaque:/m.test(rewritten) && rewritten.includes('旧树牌'));
+
+  // 6. 坐标牌不参与召回
+  const query = '多页演示 分人做 无头截图';
+  const beforeIds = (await recallMod.recall(query)).picks.map((p) => p.seed.id).join(',');
+  await reindex.reindexAll();
+  const afterIds = (await recallMod.recall(query)).picks.map((p) => p.seed.id).join(',');
+  t('plaque: 重建坐标牌不改变召回结果', beforeIds === afterIds);
+}
+
+// ───────────────────────── 夜间维护 ─────────────────────────
+{
+  const { readFile: rf, readdir } = await import('node:fs/promises');
+  const nightly = await import('../src/core/nightly.js');
+  const grow = await import('../src/schedule/grow.js');
+
+  const plan = grow.buildGrowPlan({
+    platform: 'win32', nodePath: 'n.exe', cliPath: '/x/cli.js', treesHome: '/x/forest', dir: '/tmp/gd',
+  });
+  t('nightly: 定时任务跑的是整条维护链，不是只跑 dream',
+    plan.wrapper.includes(' nightly ') && !plan.wrapper.includes(' dream --run'));
+
+  const r = await nightly.runNightly({ free: true });
+  t('nightly: 六个步骤都执行，一步失败不连累其他',
+    r.steps.length === 6
+    && r.steps.find((s) => s.name === '重建坐标牌').ok === true
+    && r.steps.find((s) => s.name === '刷新目录').ok === true);
+
+  // 上一条测试故意改坏了账本，这里正好验证「坏了会被报出来」而不是静默通过
+  t('nightly: 账本坏了会报错而不是静默通过',
+    r.steps.find((s) => s.name === '账本校验').ok === false && r.ok === false);
+
+  const treesDir = path.join(HOME, 'trees');
+  const files = (await readdir(treesDir)).filter((n) => n.endsWith('.md')).sort();
+  const before = {};
+  for (const name of files) before[name] = await rf(path.join(treesDir, name), 'utf8');
+  await nightly.runNightly({ dryRun: true });
+  let unchanged = true;
+  for (const name of files) {
+    if ((await rf(path.join(treesDir, name), 'utf8')) !== before[name]) unchanged = false;
+  }
+  t('nightly: dry-run 不改任何树文件', unchanged);
+}
+
+// ───────────────────────── 闸门 ─────────────────────────
+{
+  const { readFile: rf, writeFile: wf, mkdir: mk, stat } = await import('node:fs/promises');
+  const firewall = await import('../src/core/firewall.js');
+
+  const good = {
+    title: 'Windows .cmd 首行加 chcp 65001',
+    criteria: '在 cmd.exe 下执行含中文路径的 .cmd 时',
+    method: '首行写 chcp 65001 > nul',
+    notApplicable: '纯 PowerShell 脚本不适用；全 ASCII 路径也不需要',
+    branch: 'deepseek-flash',
+  };
+  t('gate: 合格种子放行', firewall.inspect(good).ok === true);
+
+  const vague = { ...good, notApplicable: '无' };
+  t('gate: 「不适用：无」被拦下',
+    firewall.inspect(vague).ok === false
+    && firewall.inspect(vague).errors.some((e) => e.code === 'vague-boundary'));
+
+  const missing = { ...good, notApplicable: '' };
+  t('gate: 缺一段被拦下',
+    firewall.inspect(missing).errors.some((e) => e.code === 'missing-section'));
+
+  const anonymous = { ...good, branch: '' };
+  t('gate: 没有署名被拦下 —— 匿名的经验不可审计',
+    firewall.inspect(anonymous).errors.some((e) => e.code === 'anonymous'));
+
+  const bloated = { ...good, method: 'x'.repeat(firewall.LIMITS.maxSectionChars + 1) };
+  t('gate: 单段过长被拦下（这是文档不是经验）',
+    firewall.inspect(bloated).errors.some((e) => e.code === 'too-long'));
+
+  // 拦下 ≠ 删除：进隔离区，可列出、可放行
+  const bad = { ...good, notApplicable: '看情况', title: '空泛的一条' };
+  const verdict = firewall.inspect(bad);
+  await firewall.quarantine([{ candidate: bad, verdict }], { tree: 'gate-tree', branch: 'deepseek-flash' });
+  const files = await firewall.listQuarantine();
+  const target = files.find((f) => f.title === '空泛的一条');
+  t('gate: 被拦的进隔离区而不是消失', Boolean(target) && target.reasons.includes('vague-boundary'));
+
+  const released = await firewall.acceptQuarantine(target.file);
+  t('gate: 复核后能读回来放行',
+    released.title === '空泛的一条' && released.branch === 'deepseek-flash'
+    && released.criteria === good.criteria);
+  t('gate: 放行后离开待审队列',
+    !(await firewall.listQuarantine()).some((f) => f.title === '空泛的一条'));
+
+  // ── 配置：三级查找 ──
+  const cfgMod = await import('../src/core/config.js');
+  await mk(path.join(HOME, 'confhome'), { recursive: true });
+  await wf(path.join(HOME, 'config.json'), JSON.stringify({ model: 'legacy-model', planter: 'old' }), 'utf8');
+  await wf(path.join(HOME, 'confhome', 'config.json'), JSON.stringify({ model: 'machine-model' }), 'utf8');
+
+  const merged = await cfgMod.readConfig();
+  t('config: 机器级覆盖森林里的旧配置', merged.model === 'machine-model' && merged.planter === 'old');
+
+  const migrated = await cfgMod.migrateConfig();
+  const machineRaw = JSON.parse(await rf(migrated.to, 'utf8'));
+  t('config: 迁移把旧键搬进机器级且不丢已有的',
+    machineRaw.planter === 'old' && machineRaw.model === 'machine-model');
+  t('config: 迁移保留旧文件，不删',
+    await stat(path.join(HOME, 'config.json')).then(() => true).catch(() => false));
+
+  // 收尾：把这份测试配置清掉，免得影响后面的读取
+  await wf(path.join(HOME, 'config.json'), '{}', 'utf8');
+  await wf(path.join(HOME, 'confhome', 'config.json'), '{}', 'utf8');
+}
+
+// ───────────────────────── MCP 适配器 ─────────────────────────
+{
+  const mcp = await import('../src/adapters/mcp.js');
+  const install = await import('../src/adapters/install.js');
+
+  const init = await mcp.handleMessage({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: { protocolVersion: '2099-01-01', capabilities: {}, clientInfo: { name: 't', version: '1' } },
+  });
+  t('mcp: 回显客户端要的协议版本，不硬编码',
+    init.result.protocolVersion === '2099-01-01' && init.result.serverInfo.name === 'trees');
+  t('mcp: initialize 带 instructions —— 模型才知道要先 recall',
+    init.result.instructions.includes('recall') && init.result.instructions.includes('water'));
+
+  const list = await mcp.handleMessage({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+  t('mcp: 只暴露两个工具（工具越少越容易被用对）',
+    list.result.tools.length === 2
+    && list.result.tools.map((x) => x.name).join(',') === 'recall,water');
+
+  const notified = await mcp.handleMessage({ jsonrpc: '2.0', method: 'notifications/initialized' });
+  t('mcp: 通知不回复', notified === null);
+
+  const called = await mcp.handleMessage({
+    jsonrpc: '2.0',
+    id: 3,
+    method: 'tools/call',
+    params: { name: 'recall', arguments: { task: 'Windows 批处理脚本', limit: 2 } },
+  });
+  t('mcp: recall 返回可读文本',
+    Array.isArray(called.result.content) && called.result.content[0].text.length > 20);
+
+  const badWater = await mcp.handleMessage({
+    jsonrpc: '2.0',
+    id: 4,
+    method: 'tools/call',
+    params: { name: 'water', arguments: { seed_id: 'seed-9999' } },
+  });
+  t('mcp: 浇不存在的种子返回错误而不是崩溃', badWater.result.isError === true);
+
+  const unknown = await mcp.handleMessage({ jsonrpc: '2.0', id: 5, method: 'nope/nope' });
+  t('mcp: 未知方法回 -32601', unknown.error.code === -32601);
+
+  const plan = install.buildPlan('cursor', { cliPath: '/x/cli.js', nodePath: '/x/node' });
+  t('mcp: 宿主方案只写自己那一项',
+    plan.kind === 'json' && JSON.parse(plan.snippet).mcpServers.trees.args[1] === 'mcp');
+  const tomlPlan = install.buildPlan('codex', { cliPath: '/x/cli.js', nodePath: '/x/node' });
+  t('mcp: Codex 用 TOML 段', tomlPlan.snippet.includes('[mcp_servers.trees]'));
+  t('mcp: 五个宿主都有方案',
+    ['cursor', 'cline', 'gemini', 'codex', 'claude'].every((h) => Boolean(install.buildPlan(h, { cliPath: '/x/cli.js' }))));
+}
+
+// ───────────────────────── 领域 / 分片 / 漂移 ─────────────────────────
+{
+  const shard = await import('../src/core/shard.js');
+  const drift = await import('../src/core/drift.js');
+  const recallMod = await import('../src/core/recall.js');
+  const eventsMod = await import('../src/core/events.js');
+
+  const full = (t) => `## 判据\n${t}时\n\n## 做法\n照做\n\n## 不适用\n别的时候`;
+
+  // 领域由标签确定性推导
+  const d1 = await seed.createSeed({ title: '代码相关的种子', labels: ['代码'], body: full('写代码') });
+  t('domain: 由标签推导，不靠模型', d1.domain === 'software');
+
+  // 显式写过的领域不能被重新推导覆盖 —— 否则人改的分类下次读盘就丢了
+  const d2 = await seed.createSeed({ title: '被人工改过分类的种子', labels: ['代码'], domain: 'ops', body: full('运维') });
+  t('domain: 显式写的优先，不会被标签覆盖', d2.domain === 'ops');
+  t('domain: 读回来还是 ops', (await seed.readSeed(d2.id)).domain === 'ops');
+
+  // 浇水时记下用在哪
+  await seed.waterSeed(d1.id, true, { domain: 'hardware', tree: 'proj-A' });
+  await seed.waterSeed(d1.id, true, { domain: 'hardware', tree: 'proj-A' });
+  await seed.waterSeed(d1.id, true, { domain: 'hardware', tree: 'proj-B' });
+  const waterEvents = await eventsMod.listEvents({ seed: d1.id, type: 'water' });
+  t('water: 事件带上领域与项目',
+    waterEvents.length === 3 && waterEvents[0].domain === 'hardware' && waterEvents[0].tree === 'proj-A');
+
+  await seed.waterSeed(d2.id, true, { domain: 'web', tree: 'proj-C' });
+  await seed.waterSeed(d2.id, true, { domain: 'web', tree: 'proj-C' });
+  await seed.waterSeed(d2.id, true, { domain: 'web', tree: 'proj-C' });
+
+  const r = await drift.analyzeDrift();
+  t('drift: 跨域成功 ≥3 次且 ≥2 个项目 → 新方向',
+    r.newDirections.some((x) => x.id === d1.id && x.to === 'hardware'));
+  t('drift: 跨域成功但只有一个项目 → 分类可能要改',
+    r.reclassify.some((x) => x.id === d2.id) && !r.newDirections.some((x) => x.id === d2.id));
+
+  // 分片索引
+  const built = await shard.buildShards();
+  const fresh = await shard.readShards();
+  t('shard: 建出来带领域分布', built.count > 0 && fresh.count === built.count && Object.keys(fresh.domains).length > 0);
+  t('shard: 数量对得上就算新鲜', (await shard.freshShards()) !== null);
+
+  // 新增一颗但不重建 → 索引过期，必须作废（否则新种子永远召回不到）
+  const d3 = await seed.createSeed({ title: '还没进索引的种子', labels: ['数据'], body: full('做表') });
+  t('shard: 数量对不上就作废，不拿旧索引骗人', (await shard.freshShards()) === null);
+  t('shard: 索引没了召回仍然能跑（回退全库）',
+    (await recallMod.recall(d3.title, { limit: 3 })).indexed === false);
+
+  await shard.buildShards();
+  const indexed = await recallMod.recall('写一段代码', { limit: 3 });
+  t('recall: 有新鲜索引时走索引', indexed.indexed === true && indexed.scanned > 0);
+  t('recall: 命中项带同域/跨域标记',
+    indexed.picks.every((p) => typeof p.sameDomain === 'boolean') && Boolean(indexed.domain));
+
+  // 领域标签是先验不是判决：标错/标缺的种子，靠实证在本领域翻身
+  const misfiled = {
+    id: 'seed-8801', title: '同样的任务描述', labels: ['代码'], domain: 'other',
+    body: full('写代码'), watered: 0, failed: 0, planter: '', confidence: 1,
+  };
+  const native = { ...misfiled, id: 'seed-8802', domain: 'software' };
+  const statsFor = { software: { w: 3, f: 0 } };
+  const a = recallMod.scoreSeed({ ...misfiled }, '写代码', '', { domain: 'software', domainStats: statsFor });
+  const b = recallMod.scoreSeed({ ...native }, '写代码', '', { domain: 'software' });
+  t('domain: 标成 other 但在本域验证过 3 次 → 反超标对的（不允许永久惩罚）',
+    a.score > b.score && a.domainWeight > 1);
+  t('domain: 没被验证过时仍然按先验降权', b.domainWeight === 1
+    && recallMod.scoreSeed({ ...misfiled }, '写代码', '', { domain: 'software' }).domainWeight === 0.75);
+
+  const failedOnce = { software: { w: 0, f: 2 } };
+  t('domain: 在本域失败过要往下压',
+    recallMod.scoreSeed({ ...misfiled }, '写代码', '', { domain: 'software', domainStats: failedOnce }).domainWeight < 0.75);
+}
+
+// ───────────────────────── import ─────────────────────────
+{
+  const imp = await import('../src/core/import.js');
+  const dir = path.join(HOME, 'bundle');
+  await mkdir(dir, { recursive: true });
+  const body = '## 判据\n\n当需要验证导入链路时\n\n## 做法\n\n先校验 sha256 再写盘\n\n## 不适用\n\n没有分享包时不需要导入\n';
+  const seedText = stringify({ id: 'seed-0001', title: '外来经验：先校验再导入', labels: ['代码'], planter: 'alice', state: 'buried' }, body);
+  const treeText = stringify({ id: 'import-tree', title: '外来项目', kind: 'project', planter: 'alice' }, '## 概览\n\n外来项目\n');
+  const h = (x) => createHash('sha256').update(x, 'utf8').digest('hex');
+  const manifest = {
+    format: 'trees-share/1',
+    planter: 'alice',
+    tree: { id: 'import-tree', title: '外来项目', sha256: h(treeText) },
+    seeds: [{ id: 'seed-0001', title: '外来经验：先校验再导入', planter: 'alice', sha256: h(seedText) }],
+  };
+  await writeFile(path.join(dir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
+  await writeFile(path.join(dir, 'seed-0001.md'), seedText, 'utf8');
+  await writeFile(path.join(dir, 'import-tree.md'), treeText, 'utf8');
+
+  const first = await imp.importBundle(dir);
+  const seeded = await seed.readSeed(first.imported[0].id);
+  t('import: 重新分配 seed id（不沿用对方 0001）', first.imported[0].id !== 'seed-0001');
+  t('import: 标 external 并按 0.5 降权', seeded.origin === 'external' && seeded.confidence === 0.5);
+  t('import: 署名跟原植树人，不沿用本机', seeded.planter === 'alice');
+  t('import: 本地使用痕迹清零', seeded.watered === 0 && seeded.failed === 0);
+  const importedTree = await tree.readTree(first.treeId);
+  t('import: 大树也换 id 并挂上种子',
+    Boolean(importedTree) && importedTree.seeds.includes(first.imported[0].id));
+
+  const again = await imp.importBundle(dir);
+  t('import: 重复导入按 content_hash 去重', again.skipped.length === 1 && again.imported.length === 0);
+
+  const bad = path.join(HOME, 'bundle-bad');
+  await mkdir(bad, { recursive: true });
+  await writeFile(path.join(bad, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
+  await writeFile(path.join(bad, 'seed-0001.md'), seedText + '\n手改过\n', 'utf8');
+  await writeFile(path.join(bad, 'import-tree.md'), treeText, 'utf8');
+  t('import: 校验不过整包拒绝', await throws(() => imp.importBundle(bad)));
+}
+
+// ───────────────────────── gate 软提醒留痕 ─────────────────────────
+{
+  const fw = await import('../src/core/firewall.js');
+  const glog = path.join(HOME, 'gate.log');
+  process.env.TREES_GATE_LOG = glog;
+  await fw.recordWarnings(
+    [{ title: '有提醒的种子', warnings: [{ code: 'no-anchor', message: '判据没有具体线索' }] }],
+    { tree: 't-demo', branch: 'b-demo' },
+  );
+  const text = await readFile(glog, 'utf8');
+  delete process.env.TREES_GATE_LOG;
+  t('gate: 软提醒只写日志不拦', text.includes('no-anchor') && text.includes('有提醒的种子'));
+}
+
+// ───────────────────────── 会话回写：dry-run 与幂等 ─────────────────────────
+{
+  const ses = await import('../src/core/session.js');
+  const fakeModel = async () => ({
+    text: JSON.stringify({
+      title: '自测会话', summary: '跑了一遍回写', project_status: 'ongoing',
+      status_reason: '自测', open_threads: [], explicit_complete: false,
+    }),
+  });
+  const material = '用户：测试会话回写链路。'.repeat(60);
+  const cfg = { autoPlant: true, autoFinish: false, model: 'test' };
+  const logPath = path.join(HOME, 'auto.log');
+
+  const dry = await ses.runAuto({ material, cwd: HOME, dryRun: true, config: cfg, callModel: fakeModel, logPath });
+  t('auto: dry-run 不落盘（以前会偷偷写树）', dry.dryRun === true && (await tree.readTree(dry.key)) === null);
+
+  const real = await ses.runAuto({ material, cwd: HOME, config: cfg, callModel: fakeModel, logPath });
+  t('auto: 真跑写入会话树', Boolean(await tree.readTree(real.key)));
+
+  const again = await ses.runAuto({ material, cwd: HOME, config: cfg, callModel: fakeModel, logPath });
+  t('auto: 同一份对话只记一次', Boolean(again.skipped));
+}
+
+// ───────────────────────── DSH 适配器（Cordis 插件） ─────────────────────────
+{
+  const dsh = await import('../adapters/dsh-plugin/index.js');
+  t('dsh: 插件名与依赖声明', dsh.name === 'trees' && Array.isArray(dsh.inject) && dsh.inject.includes('agents'));
+
+  const events = [
+    { type: 'user/message', data: { content: [{ type: 'text', text: '帮我看看 Windows 批处理' }], source: { kind: 'user' } } },
+    { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '好的' }] } } },
+    { type: 'user/message', data: { content: [{ type: 'text', text: '这是插件注入' }], source: { kind: 'plugin', plugin: 'x' } } },
+  ];
+  const agent = { session: { events } };
+  t('dsh: 取最近的人类消息（跳过插件注入）', dsh.latestUserText(agent) === '帮我看看 Windows 批处理');
+
+  const transcript = dsh.toTranscript(events);
+  t('dsh: 会话转 JSONL 只留人/AI 文本',
+    transcript.includes('"type":"user"') && transcript.includes('"type":"assistant"')
+    && !transcript.includes('插件注入'));
+
+  // 用假 CLI 跑通 pre-step 注入，不依赖真实 DSH
+  const fakeCli = path.join(HOME, 'fake-trees-cli.js');
+  await writeFile(fakeCli, "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{console.log('## Trees 测试召回');});", 'utf8');
+  let handler = null;
+  const ctx = { on: (ev, fn) => { if (ev === 'agent/pre-step') handler = fn; }, logger: { info() {} } };
+  dsh.apply(ctx, { cli: fakeCli, recall: true, record: false });
+  const out1 = await handler({ agent, turn: 1, step: 1, signal: { aborted: false } },
+    async () => ({ kind: 'enter', messages: [] }));
+  t('dsh: pre-step 注入召回结果', out1.messages.length === 1
+    && JSON.stringify(out1.messages[0].content).includes('Trees 测试召回'));
+  const out2 = await handler({ agent, turn: 1, step: 2, signal: { aborted: false } },
+    async () => ({ kind: 'enter', messages: [] }));
+  t('dsh: 同一轮只在第一步注入', out2.messages.length === 0);
 }
 
 console.log(log.join('\n'));

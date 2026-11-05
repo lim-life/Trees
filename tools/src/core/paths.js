@@ -1,4 +1,5 @@
 import path from 'node:path';
+import os from 'node:os';
 import fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 
@@ -24,8 +25,20 @@ function findRepoForest(start) {
 }
 
 /**
+ * 机器级默认森林：找不到项目自带的森林时用它。
+ * 这样在任意新项目目录里跑 CLI 都接到同一个库，而不是悄悄建一个空库
+ * （空库里没有种子，看起来就像「什么都没发生」）。
+ * @returns {string}
+ */
+export function homeForest() {
+  return path.join(os.homedir(), '.trees', 'forest');
+}
+
+/**
  * 获取森林根目录的绝对路径。
- * 顺序：TREES_HOME → 最近的仓库根 forest → 当前工作目录下的 forest。
+ * 顺序：TREES_HOME → 最近的仓库根 forest → 已存在的 cwd/forest → ~/.trees/forest。
+ * 注意 cwd/forest 只认「已经存在」的：跑到陌生目录时回退到机器级库，
+ * 而不是凭空创建一个空森林。
  * @returns {string} 森林根目录绝对路径
  */
 export function getForestRoot() {
@@ -35,8 +48,9 @@ export function getForestRoot() {
   if (fromEnv) {
     _forestRoot = path.resolve(fromEnv);
   } else {
+    const local = path.resolve(process.cwd(), 'forest');
     _forestRoot = findRepoForest(process.cwd())
-      ?? path.resolve(process.cwd(), 'forest');
+      ?? (existsSync(local) ? local : homeForest());
   }
   return _forestRoot;
 }

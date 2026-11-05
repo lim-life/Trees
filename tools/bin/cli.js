@@ -8,7 +8,10 @@
  * 用法： trees <命令> [参数]      （trees help 看全部命令）
  */
 import process from 'node:process';
-import { readFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { readFile, stat, readdir } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { ensureDirs, getForestRoot } from '../src/core/paths.js';
 import {
@@ -23,10 +26,20 @@ import {
 import {
   planDream, runDream, FRESH_DAYS, ROTTING_MARGIN_DAYS,
 } from '../src/core/dream.js';
-import { readConfig, writeConfig, configPath, getPlanter } from '../src/core/config.js';
+import {
+  readConfig, writeConfig, configPath, getPlanter, configSources, migrateConfig,
+} from '../src/core/config.js';
 import { listEvents, verifyEvents } from '../src/core/events.js';
 import { plantFrom } from '../src/core/plant.js';
 import { shareTree } from '../src/core/share.js';
+import { importBundle } from '../src/core/import.js';
+import { reindexTree, reindexAll } from '../src/core/reindex.js';
+import { runNightly } from '../src/core/nightly.js';
+import { analyzeDrift, MIN_CROSS, MIN_PROJECTS } from '../src/core/drift.js';
+import { listQuarantine, acceptQuarantine } from '../src/core/firewall.js';
+import { runMcpServer } from '../src/adapters/mcp.js';
+import { buildPlan, installHost, HOSTS } from '../src/adapters/install.js';
+import { renderIndexDetail, isProvisional } from '../src/core/plaque.js';
 import { findDuplicates, judgePair } from '../src/core/dedup.js';
 import { scoreSeed, scoreMissing, scorerCallModel } from '../src/core/scorer.js';
 import { summarize } from '../src/core/stats.js';
@@ -36,7 +49,7 @@ import { renderIndex, writeIndex } from '../src/core/indexer.js';
 import { runAuto, readAutoLog, autoLogPath } from '../src/core/session.js';
 import {
   finishProject, unfinishProject, plantBranch, recycleBranch, plantProject,
-  findLastKey, writeLastKey, resolveChain,
+  findLastKey, writeLastKey, resolveChain, currentProject,
 } from '../src/core/project.js';
 import {
   buildGrowPlan, install as growInstall, uninstall as growUninstall,
@@ -100,6 +113,7 @@ ${c.cyan}种子${c.reset}
   trees ls [--state <状态>]        列出种子
   trees show <seed-id>             看种子详情
   trees water <seed-id> [--fail]   浇水（成功 +1 并推进状态；--fail 记失败且不推进）
+  trees water-tree <tree-id> [--in <领域>]   给整棵树的种子浇水（定时复盘用）
   trees score <seed-id> [--force]  给种子打静态向量（D1/D2/D4）+ D3 先验
   trees score --missing [--limit N] 给还没有向量的种子补分
   trees find <关键词>              按标题/标签/正文检索
@@ -116,9 +130,13 @@ ${c.cyan}种子${c.reset}
 ${c.cyan}大树 / 森林${c.reset}
   trees trees [--all]              列出所有大树（默认不看会话节点）
   trees tree <tree-id>             看一棵树（含挂在它下面的种子）
-  trees plaque <tree-id> ["一句话"] [--labels a,b]
-                                   看/改树牌（列表只显示树牌）
+  trees plaque <tree-id> ["备注"] [--labels a,b]
+                                   看坐标牌 / 改人写的备注（备注不参与计算）
+  trees reindex <tree-id> [--dry-run]
+                                   从种子重建这棵树的坐标牌（确定性，不用模型）
+  trees reindex --all [--dry-run]  重建全部项目大树的坐标牌
   trees share <tree-id>            把这棵树和它的种子打成可 git 发布的包（默认全部私有）
+  trees import <发布包目录>         校验 sha256 → 去重 → 重编号 → 标 external 后导入
   trees forest <子树> --under <父树>   建强关联（自动防环）
 
 ${c.cyan}蒸馏${c.reset} ${c.dim}（按需蒸馏 —— 这个项目的核心）${c.reset}
@@ -136,8 +154,23 @@ ${c.cyan}黑夜循环${c.reset} ${c.dim}（系统自跑 —— 默认只出计�
 ${c.cyan}播种${c.reset} ${c.dim}（把做过的事变成种子）${c.reset}
   trees plant <项目路径>           从项目里提取种子，同时长出一棵大树
   trees plant <路径> --dry-run     只看看会提出什么，不落盘
+  trees plant <路径> --max-bytes 120000   材料上限（默认 60000 字节 / 40 个文件）
+  trees gate                       看隔离区（被闸门拦下、还没进库的种子）
+  trees gate --accept <序号>        复核后放行一条
+
+${c.cyan}接入${c.reset} ${c.dim}（让编辑器直接用上这个库）${c.reset}
+  trees mcp                        起 MCP 服务（宿主会这么调它）
+  trees mcp --show                 打印各宿主该配的片段，什么都不写
+  trees mcp --install <宿主>       自动写进 cursor / cline / claude / codex / gemini，或 all
+
+${c.cyan}领域${c.reset} ${c.dim}（经验在哪个领域被验证过）${c.reset}
+  trees water <id> --in <领域>     记下这次是在哪个领域用上的（默认取当前项目树的领域）
+  trees drift                       哪些种子正在跨域生效 —— 新方向，还是分类改错了
 
 ${c.cyan}自然生长${c.reset} ${c.dim}（让它在你不用的时段自己长一会儿）${c.reset}
+  trees nightly [--free] [--dry-run]
+                                   一次跑完：账本校验 → 入盒 → 补分 → 学习 → 坐标牌 → 目录
+                                   --free 只跑不花钱的步骤；定时任务跑的就是它
   trees grow                       看装没装
   trees grow --show                只打印它会往你电脑上写什么，不动系统
   trees grow --install [--at HH:MM] 装上（默认 03:17）
@@ -169,7 +202,7 @@ ${c.cyan}索引 / 环境${c.reset}
   trees stats [--json]             统计：状态/植树人/事件/调用（不花模型钱）
 
 ${c.cyan}尚未实现${c.reset} ${c.dim}（需要接 LLM，见 docs/00-SPEC.md §5）${c.reset}
-  health  import  export  profile  uninstall
+  health  export  profile  uninstall
 
 ${c.dim}数据目录：${getForestRoot()}${c.reset}
 `;
@@ -264,7 +297,12 @@ async function cmdWater() {
   const before = await readSeed(id);
   if (!before) return err(`找不到种子：${id}`);
   const ok = !hasFlag('--fail');
-  const after = await waterSeed(id, ok);
+
+  // 使用上下文：--in 优先；否则顺着 last-key 找当前项目树的领域；都没有记 unknown。
+  // 不能省 —— 没有它就算不出「这颗种子在哪些领域真的行」。
+  const project = await currentProject(process.cwd());
+  const domain = valueOf('--in') || project?.index?.domain || 'unknown';
+  const after = await waterSeed(id, ok, { domain, tree: project?.id || '' });
   if (ok) {
     const moved = after.state !== before.state;
     console.log(`💧 ${after.id} 浇水成功（第 ${after.watered} 次）`);
@@ -273,6 +311,28 @@ async function cmdWater() {
   } else {
     console.log(`${c.yellow}✗ ${after.id} 记了一次失败（第 ${after.failed} 次）—— 状态不降级${c.reset}`);
   }
+}
+
+/** 给一整棵树浇水：定时复盘用（每晚一次）。 */
+async function cmdWaterTree() {
+  const id = plainArgs[0];
+  if (!id) return err('用法：trees water-tree <tree-id> [--fail] [--in <领域>]');
+  const tree = await readTree(id);
+  if (!tree) return err(`找不到大树：${id}`);
+  if (tree.kind === 'session') return err('会话树不浇水；先合并成项目大树');
+
+  const ok = !hasFlag('--fail');
+  const domain = valueOf('--in') || tree.index?.domain || 'unknown';
+  let n = 0;
+  for (const sid of tree.seeds) {
+    const before = await readSeed(sid);
+    if (!before) continue;
+    const after = await waterSeed(sid, ok, { domain, tree: id });
+    n++;
+    const moved = after.state !== before.state;
+    console.log(`${ok ? '💧' : '✗'} ${sid} ${before.state}${moved ? ` → ${after.state}` : ''}  ${before.title}`);
+  }
+  console.log(`${id}: ${ok ? '浇水' : '记失败'} ${n} 颗（领域 ${domain}）`);
 }
 
 async function cmdFind() {
@@ -336,6 +396,28 @@ async function cmdRecall() {
   console.log(renderRecall(result));
 }
 
+/**
+ * UserPromptSubmit hook：每条用户消息进来时先做一次轻量召回。
+ * 空召回就什么都不输出（不制造噪音）；有命中才把几颗种子注进上下文。
+ */
+async function cmdHookRecall() {
+  let prompt = '';
+  try {
+    const payload = JSON.parse(await readStdin());
+    prompt = String(payload.prompt || payload.user_prompt || '');
+  } catch {
+    return;
+  }
+  prompt = prompt.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
+  if (prompt.length < 4) return;
+
+  try {
+    const result = await recall(prompt, { limit: 3, budget: 700 });
+    if (!result.picks?.length) return;
+    console.log(renderRecall(result));
+  } catch { /* hook 不能因为召回失败打断用户 */ }
+}
+
 async function cmdBox() {
   const id = plainArgs[0];
   if (!id) return err('用法：trees box <seed-id>');
@@ -396,11 +478,51 @@ async function cmdAuto() {
 
   if (hasFlag('--hook')) {
     // Claude Code 的 SessionEnd hook 从 stdin 递 JSON
+    let payload = null;
     try {
-      const payload = JSON.parse(await readStdin());
+      payload = JSON.parse(await readStdin());
       transcript = payload.transcript_path || transcript;
       cwd = payload.cwd || cwd;
     } catch { /* stdin 不是 JSON 就按参数来 */ }
+
+    // 兜底：harness 给的 transcript_path 有时不存在（已观测到多次 ENOENT）。
+    // 先按 session_id 找同名文件，再退到同目录最新的 .jsonl；已录过的会被去重拦下。
+    if (transcript && !existsSync(transcript)) {
+      const dir = path.dirname(transcript);
+      const sidFile = payload?.session_id ? path.join(dir, `${payload.session_id}.jsonl`) : '';
+      let picked = sidFile && existsSync(sidFile) ? sidFile : '';
+      if (!picked) {
+        try {
+          const files = (await readdir(dir)).filter((f) => f.endsWith('.jsonl'));
+          const ranked = await Promise.all(files.map(async (f) => {
+            const file = path.join(dir, f);
+            const info = await stat(file).catch(() => null);
+            return { file, mtime: info?.isFile() ? info.mtimeMs : 0 };
+          }));
+          ranked.sort((a, b) => b.mtime - a.mtime);
+          picked = ranked[0]?.mtime ? ranked[0].file : '';
+        } catch { /* 目录读不了就保持原样，交给 runAuto 报跳过了什么 */ }
+      }
+      if (picked) transcript = picked;
+    }
+
+    // 有些 hook（如 PreCompact）可能只给 session_id/cwd，不给 transcript_path：
+    // 按 Claude Code 的项目目录规则找最新的 .jsonl。
+    if (!transcript && cwd) {
+      try {
+        const abs = path.resolve(cwd);
+        const slug = abs.replace(/^([A-Za-z]):/, (_, d) => `${d.toLowerCase()}-`).replace(/[\\/]/g, '-');
+        const dir = path.join(os.homedir(), '.claude', 'projects', slug);
+        const files = (await readdir(dir)).filter((f) => f.endsWith('.jsonl'));
+        const ranked = await Promise.all(files.map(async (f) => {
+          const file = path.join(dir, f);
+          const info = await stat(file).catch(() => null);
+          return { file, mtime: info?.isFile() ? info.mtimeMs : 0 };
+        }));
+        ranked.sort((a, b) => b.mtime - a.mtime);
+        transcript = ranked[0]?.mtime ? ranked[0].file : '';
+      } catch { /* 找不到就交给 runAuto 报告跳过原因 */ }
+    }
   }
 
   if (!transcript && !hasFlag('--hook')) {
@@ -703,18 +825,27 @@ async function cmdDream() {
 async function cmdPlant() {
   const target = args[0] && !args[0].startsWith('-') ? args[0] : '';
   if (!target) {
-    return err('用法：trees plant <项目路径> [--dry-run] [--tree <大树id>] [--branch <模型名>]');
+    return err('用法：trees plant <项目路径> [--dry-run] [--tree <大树id>] [--branch <模型名>] [--max-bytes N] [--max-files N]');
   }
 
   const dry = hasFlag('--dry-run');
   console.log(`🌱 正在读 ${target} ...`);
+
+  // 闸门要求署名：每条经验都得能追到是哪个 AI 写的，匿名的进不了库
+  const cfg = await readConfig();
+  const branch = valueOf('--branch') || String(cfg.model || '').trim();
+  if (!branch) {
+    return err('没有可署名的 AI：加 --branch <模型名>，或先 trees config 配好模型。');
+  }
 
   try {
     const r = await plantFrom({
       path: target,
       dryRun: dry,
       treeId: valueOf('--tree'),
-      fromBranch: valueOf('--branch') || '',
+      fromBranch: branch,
+      maxFiles: Number(valueOf('--max-files')) || undefined,
+      maxBytes: Number(valueOf('--max-bytes')) || undefined,
     });
 
     console.log(`   读了 ${r.filesRead} 个文件${r.truncated ? '（还有更多，先读到这）' : ''}`);
@@ -753,6 +884,25 @@ async function cmdPlant() {
       }
     }
 
+    if (r.rejected?.length) {
+      console.log(`
+${c.yellow}🚧 闸门拦下 ${r.rejected.length} 条${c.reset} ${c.dim}（不删除，进 forest/quarantine/ 等复核）${c.reset}`);
+      for (const item of r.rejected) {
+        console.log(`   ${item.title || '(无标题)'}`);
+        for (const e of item.errors) console.log(`      ${c.dim}[${e.code}] ${e.message}${c.reset}`);
+      }
+      console.log(`${c.dim}   复核：trees gate${c.reset}`);
+    }
+
+    // 软提醒只在 dry-run 时给人看；真跑时写进 gate.log，不刷屏
+    if (dry && r.warnings?.length) {
+      console.log(`
+${c.dim}⚠️ ${r.warnings.length} 条有提醒（没拦，真跑时只记进 ~/.trees/gate.log）${c.reset}`);
+      for (const item of r.warnings) {
+        for (const w of item.warnings) console.log(`   ${c.dim}${item.title} · ${w.message}${c.reset}`);
+      }
+    }
+
     if (r.leaves.length) {
       console.log(`
 🍂 ${r.leaves.length} 条落叶：${c.dim}${r.leaves.join(' / ')}${c.reset}`);
@@ -771,6 +921,15 @@ ${c.green}✓ 已落盘${c.reset} ${c.dim}—— 种子是 buried、watered 0，
 }
 
 async function cmdConfig() {
+  if (hasFlag('--migrate')) {
+    const r = await migrateConfig();
+    if (!r.moved) return console.log(`${c.dim}${r.reason}：${r.from}${c.reset}`);
+    console.log(`✅ 已搬到 ${r.to}${r.reason ? `（${r.reason}）` : ''}`);
+    console.log(`${c.dim}   旧文件保留：${r.from}${c.reset}`);
+    console.log(`${c.dim}   森林从此是纯数据，可以随便拷；配置跟着这台机器走。${c.reset}`);
+    return;
+  }
+
   const patch = {};
   if (valueOf('--base-url')) patch.baseUrl = valueOf('--base-url');
   if (valueOf('--model')) patch.model = valueOf('--model');
@@ -799,8 +958,11 @@ async function cmdConfig() {
   }
 
   const cfg = await readConfig();
-  console.log(`
-配置文件：${configPath()}`);
+  console.log('\n来源（后者覆盖前者）：');
+  for (const s of await configSources()) {
+    console.log(`   ${s.exists ? c.green + '✓' + c.reset : c.dim + '·' + c.reset} ${s.role}  ${c.dim}${s.path}${c.reset}`);
+  }
+  console.log(`写入位置：${configPath()}`);
   if (!Object.keys(cfg).length) {
     console.log(`${c.dim}   还是空的。可以：${c.reset}`);
     console.log(`${c.dim}   trees config --from-env              （把当前环境变量存进去）${c.reset}`);
@@ -958,10 +1120,10 @@ async function cmdDedup() {
   }
 }
 
-/** 树牌：一句话 + 标签；列表/索引只显示它，正文按需展开。 */
+/** 坐标牌：从种子投影出来的指针集合。人改不动牌，只能加备注。 */
 async function cmdPlaque() {
   const id = args[0] && !args[0].startsWith('-') ? args[0] : '';
-  if (!id) return err('用法：trees plaque <tree-id> ["一句话"] [--labels a,b]');
+  if (!id) return err('用法：trees plaque <tree-id> ["备注"] [--labels a,b]');
 
   const tree = await readTree(id);
   if (!tree) return err(`没有这棵大树：${id}`);
@@ -969,13 +1131,51 @@ async function cmdPlaque() {
   const text = args[1] && !args[1].startsWith('-') ? args[1] : '';
   const labelsRaw = valueOf('--labels');
   const patch = {};
-  if (text) patch.plaque = text;
+  if (text) {
+    patch.curator_note = text;
+    patch.curator_note_source = 'human';
+  }
   if (labelsRaw) patch.labels = labelsRaw.split(',').map((x) => x.trim()).filter(Boolean);
 
   const next = Object.keys(patch).length ? await writeTree({ ...tree, ...patch }) : tree;
-  console.log(`${c.cyan}${next.id}${c.reset}  ${next.plaque || c.dim + '(无树牌)' + c.reset}`);
+  const seeds = await getTreeSeeds(id);
+  for (const line of renderIndexDetail(next.index, seeds, { provisional: isProvisional(seeds) })) {
+    console.log(line);
+  }
+  if (next.curator_note) {
+    const source = next.curator_note_source ? `（${next.curator_note_source}）` : '';
+    console.log(`\n备注    ${next.curator_note}${source}`);
+  }
   console.log(`   标签：${(next.labels || []).join(', ') || '(无)'}`);
   console.log(`   植树人：${next.planter || '(未知)'}  ·  ${(next.branches || []).length} 分支 / ${(next.seeds || []).length} 种子`);
+}
+
+/** 重建坐标牌：纯派生，不用模型，不改 updated，不记事件。 */
+async function cmdReindex() {
+  const id = plainArgs[0];
+  const all = hasFlag('--all');
+  const dry = hasFlag('--dry-run');
+
+  if (!id && !all) return err('用法：trees reindex <tree-id> | trees reindex --all [--dry-run]');
+  if (id && all) return err('--all 和 tree-id 只能二选一');
+
+  const result = id
+    ? { items: [await reindexTree(id, { dryRun: dry })] }
+    : await reindexAll({ dryRun: dry });
+  const updated = result.items.filter((item) => item.changed).length;
+  const unchanged = result.items.length - updated;
+
+  for (const item of result.items) {
+    if (!item.changed) continue;
+    const before = item.before
+      ? `${item.before.domain}/${item.before.artifact}/${item.before.size} · ${item.before.refs.length} 条`
+      : '(空)';
+    const after = `${item.after.domain}/${item.after.artifact}/${item.after.size} · ${item.after.refs.length} 条`;
+    console.log(`${c.cyan}${item.id}${c.reset}  ${before} → ${after}`);
+  }
+
+  const head = dry ? `${c.dim}(dry-run，什么都没写)${c.reset} ` : '';
+  console.log(`${head}已更新 ${updated} 棵，未变化 ${unchanged} 棵`);
 }
 
 /** 选择性发布：只把这棵树和它挂着的种子放进 git 发布包。 */
@@ -984,10 +1184,41 @@ async function cmdShare() {
   if (!id) return err('用法：trees share <tree-id>');
 
   const { dir, manifest } = await shareTree(id);
+  const board = manifest.tree.index
+    ? `${manifest.tree.index.domain}/${manifest.tree.index.artifact}/${manifest.tree.index.size}`
+    : '(无坐标牌)';
   console.log(`📦 发布包：${dir}`);
-  console.log(`   ${manifest.seeds.length} 颗种子 · 树牌：${manifest.tree.plaque || '(无)'}`);
+  console.log(`   ${manifest.seeds.length} 颗种子 · 坐标牌：${board}`);
   console.log(`${c.dim}只复制这棵树挂着的种子；没有联网，也没有删除任何东西。${c.reset}`);
   console.log(`${c.dim}下一步：把整个目录提交到公开 git 仓库；订阅方先核对 manifest.json 里的 sha256。${c.reset}`);
+}
+
+async function cmdImport() {
+  const dir = args[0] && !args[0].startsWith('-') ? args[0] : '';
+  if (!dir) return err('用法：trees import <发布包目录> [--dry-run]');
+
+  let r;
+  try {
+    r = await importBundle(dir, { dryRun: hasFlag('--dry-run') });
+  } catch (e) {
+    return err(e.message);
+  }
+
+  const tag = r.dryRun ? `${c.dim}[dry-run] ${c.reset}` : '';
+  console.log(`${tag}📥 校验通过 ${r.verified} 个文件（sha256 全部一致）`);
+  if (r.imported.length) {
+    console.log(`   新收 ${r.imported.length} 颗 ${c.dim}（external · confidence 0.5 · 署名保留原植树人）${c.reset}`);
+    for (const item of r.imported) {
+      console.log(`   ${item.id === '(dry-run)' ? item.sourceId : `${item.id} ← ${item.sourceId}`}  ${item.title}`);
+    }
+  }
+  if (r.skipped.length) {
+    console.log(`   已有 ${r.skipped.length} 颗 ${c.dim}（按 content_hash 去重，直接挂到树上）${c.reset}`);
+    for (const item of r.skipped) console.log(`   ${item.localId ?? '(dry-run)'} ← ${item.sourceId}  ${item.title}`);
+  }
+  if (r.dryRun) return console.log(`${c.dim}   没有写盘。去掉 --dry-run 才会真正导入。${c.reset}`);
+  console.log(`🌳 大树 ${r.treeId}（id 已在本地存在时会自动加 -ext 后缀）`);
+  console.log(`${c.dim}导入的是数据，不是指令；用之前先自己验证。${c.reset}`);
 }
 
 /** 事件账本：谁在什么时候对哪颗种子做了什么。 */
@@ -1021,6 +1252,137 @@ async function cmdEvents() {
     const title = e.title ? `  ${e.title}` : '';
     console.log(`${c.dim}${e.ts}${c.reset}  ${e.type.padEnd(6)}${who}  ${target}${title}`);
   }
+}
+
+/** 漂移：哪些种子正在跨域生效 —— 新方向，还是分类改错的信号。 */
+async function cmdDrift() {
+  const r = await analyzeDrift();
+  if (!r.crossEvents) {
+    console.log(`${c.dim}还没有跨域数据。浇水时记下领域（--in，或在一个项目目录里）才会有。${c.reset}`);
+    return;
+  }
+
+  if (r.newDirections.length) {
+    console.log(`${c.green}🧭 可能是新方向${c.reset} ${c.dim}（跨域成功 ≥${MIN_CROSS} 次且来自 ≥${MIN_PROJECTS} 个项目）${c.reset}\n`);
+    for (const item of r.newDirections) {
+      console.log(`  ${c.cyan}${item.id}${c.reset}  ${item.title}`);
+      console.log(`     ${c.dim}${item.from} → ${item.to} · 用了 ${item.uses} 次 · ${item.count} 个项目：${item.projects.join(', ')}${c.reset}`);
+      console.log(`     ${c.dim}这颗可能本来就是跨域的基础经验。要不要把它的领域改宽，或直接合成？${c.reset}`);
+    }
+    console.log('');
+  }
+
+  if (r.reclassify.length) {
+    console.log(`${c.yellow}🔧 分类可能要改${c.reset} ${c.dim}（跨域成功但只在一个项目里 —— 更像当初分错了）${c.reset}\n`);
+    for (const item of r.reclassify) {
+      console.log(`  ${c.cyan}${item.id}${c.reset}  ${item.title}`);
+      console.log(`     ${c.dim}${item.from} → ${item.to} · 用了 ${item.uses} 次，都在 ${item.projects[0]}${c.reset}`);
+    }
+    console.log('');
+    console.log(`${c.dim}改领域：直接编辑种子文件的 domain 字段（显式写的不会被重新推导覆盖）${c.reset}`);
+  }
+
+  if (!r.newDirections.length && !r.reclassify.length) {
+    console.log(`${c.dim}跨域事件 ${r.crossEvents} 次，都还不到判定的门槛（${MIN_CROSS} 次）。${c.reset}`);
+  }
+}
+
+/** MCP：起服务，或者把服务挂到各个宿主上。 */
+async function cmdMcp() {
+  const host = valueOf('--install') || '';
+  const show = hasFlag('--show') || (!host && hasFlag('--show'));
+
+  if (host === 'all') {
+    for (const name of Object.keys(HOSTS)) {
+      const r = await installHost(name, { cliPath: SELF });
+      console.log(`${r.ok ? c.green + '✓' + c.reset : c.dim + '·' + c.reset} ${HOSTS[name].label}  ${r.ok ? '' : c.dim + r.message.split('\n')[0] + c.reset}`);
+    }
+    return;
+  }
+
+  if (host) {
+    const r = await installHost(host, { cliPath: SELF });
+    console.log(r.ok ? `✅ ${r.message}` : `${c.yellow}${r.message}${c.reset}`);
+    if (r.ok) console.log(`${c.dim}   重启宿主后生效；两个工具：recall（接任务前）/ water（用过之后）${c.reset}`);
+    return;
+  }
+
+  if (show || hasFlag('--print')) {
+    console.log(`${c.cyan}Trees MCP${c.reset} ${c.dim}—— 零依赖，只暴露两个工具：recall / water${c.reset}\n`);
+    for (const name of Object.keys(HOSTS)) {
+      const plan = buildPlan(name, { cliPath: SELF });
+      console.log(`${c.cyan}${plan.hint || HOSTS[name].label}${c.reset}`);
+      if (plan.command) {
+        console.log(`  ${plan.command.cmd} ${plan.command.args.join(' ')}\n`);
+      } else {
+        console.log(`${c.dim}  文件：${plan.file}${c.reset}`);
+        for (const line of plan.snippet.trim().split('\n')) console.log(`  ${c.dim}${line}${c.reset}`);
+        console.log('');
+      }
+    }
+    console.log(`${c.dim}自动写：trees mcp --install cursor|cline|claude|codex|gemini|all${c.reset}`);
+    return;
+  }
+
+  // 没有参数 = 起服务。宿主就是这么调它的。
+  await runMcpServer();
+}
+
+/** 闸门：看隔离区，复核后放行。拦下的东西不删，只是不进库。 */
+async function cmdGate() {
+  const acceptRaw = valueOf('--accept');
+  const items = await listQuarantine();
+
+  if (acceptRaw !== undefined) {
+    const index = Number(acceptRaw);
+    const item = items[index - 1];
+    if (!item) return err(`隔离区里没有第 ${acceptRaw} 条`);
+    const candidate = await acceptQuarantine(item.file);
+
+    const body = [
+      '## 判据', candidate.criteria || '',
+      '', '## 做法', candidate.method || '',
+      '', '## 不适用', candidate.notApplicable || '',
+    ].join('\n');
+    const created = await createSeed({
+      title: candidate.title,
+      body,
+      from_branch: candidate.branch || '',
+    });
+    console.log(`✅ 已放行：${created.id}  ${created.title}`);
+    return;
+  }
+
+  if (!items.length) {
+    console.log(`${c.green}隔离区是空的。${c.reset} ${c.dim}（被拦下的种子会出现在这里）${c.reset}`);
+    return;
+  }
+
+  console.log(`🚧 隔离区 ${items.length} 条 —— 拦下不等于丢弃，复核后可以放行\n`);
+  items.forEach((item, i) => {
+    console.log(`${c.cyan}${i + 1}${c.reset}  ${item.title}`);
+    for (const line of item.reasons.split('\n')) {
+      if (line.trim()) console.log(`   ${c.dim}${line.trim()}${c.reset}`);
+    }
+  });
+  console.log(`\n${c.dim}放行：trees gate --accept <序号>${c.reset}`);
+}
+
+/** 夜间维护：把散落的动作串成一条链。定时任务跑的就是这个。 */
+async function cmdNightly() {
+  const dry = hasFlag('--dry-run');
+  const free = hasFlag('--free');
+  const result = await runNightly({ dryRun: dry, free });
+
+  const label = free ? '（仅免费步骤）' : '';
+  const mark = dry ? '（dry-run，什么都没写）' : '';
+  console.log(`🌙 夜间维护${label}${mark}`);
+  for (const s of result.steps) {
+    const flag = s.ok ? `${c.green}✓${c.reset}` : `${c.red}✗${c.reset}`;
+    console.log(`  ${flag} ${s.name}  ${c.dim}${s.detail}${c.reset}`);
+  }
+  if (result.spentTokens) console.log(`  ${c.dim}今晚花了 ${result.spentTokens} tokens${c.reset}`);
+  if (!result.ok) process.exitCode = 1;
 }
 
 async function cmdGrow() {
@@ -1059,7 +1421,9 @@ async function cmdGrow() {
     console.log(r.ok ? `🌱 ${r.message}` : `${c.red}✗ ${r.message}${c.reset}`);
     if (r.ok) {
       console.log(`${c.dim}   任务名：${TASK_NAME}${c.reset}`);
-      console.log(`${c.dim}   它只做学习：补旁证和正文，不加浇水、不升状态。${c.reset}`);
+      console.log(`${c.dim}   每晚跑：账本校验 → 入盒 → 补分 → 学习 → 坐标牌 → 目录。${c.reset}`);
+      console.log(`${c.dim}   学习只补旁证和正文，不加浇水、不升状态。${c.reset}`);
+      console.log(`${c.dim}   日志：${plan.logPath}${c.reset}`);
       console.log(`${c.dim}   想关掉：trees grow --uninstall${c.reset}`);
     }
     return;
@@ -1119,8 +1483,13 @@ async function cmdTree() {
     }
   }
   const seeds = await getTreeSeeds(id);
+  console.log('');
+  for (const line of renderIndexDetail(t.index, seeds, { provisional: isProvisional(seeds) })) {
+    console.log(line);
+  }
+  if (t.curator_note) console.log(`\n备注    ${t.curator_note}（${t.curator_note_source || 'human'}）`);
   if (seeds.length) {
-    console.log('  种子：');
+    console.log('\n  种子：');
     for (const s of seeds) console.log(seedLine(s));
   }
   if (t.body) console.log(`\n${t.body.trim()}`);
@@ -1194,16 +1563,26 @@ async function main() {
   }
 
   // 除 init 自己处理 --dry-run 外，都先把目录准备好（幂等）—— 空库也不能报错
-  if (cmd !== 'init') await ensureDirs();
+  // 只在**已有的** forest 里补目录。以前每个命令都无条件 ensureDirs，
+  // 结果在任何无关目录跑一次 trees，就留下一个空的 forest/seeds、forest/box。
+  // 真正要写数据的地方（persist / writeIndex）自己还会再调一次，不依赖这里。
+  if (cmd !== 'init') {
+    const root = getForestRoot();
+    const exists = await stat(root).then((s) => s.isDirectory()).catch(() => false);
+    if (exists) await ensureDirs();
+  }
 
   const table = {
     init: cmdInit, new: cmdNew, ls: cmdLs, list: cmdLs, show: cmdShow, water: cmdWater,
     find: cmdFind, search: cmdSearch, dedup: cmdDedup, recall: cmdRecall, box: cmdBox, summon: cmdSummon, sweep: cmdSweep,
+    'water-tree': cmdWaterTree,
     score: cmdScore, stats: cmdStats,
-    trees: cmdTrees, tree: cmdTree, plaque: cmdPlaque, share: cmdShare, forest: cmdForest, status: cmdStatus,
+    trees: cmdTrees, tree: cmdTree, plaque: cmdPlaque, reindex: cmdReindex, share: cmdShare, import: cmdImport, forest: cmdForest, status: cmdStatus,
     candidates: cmdCandidates, synthesize: cmdSynthesize, unsynthesize: cmdUnsynthesize,
     waiting: cmdWaiting, need: cmdNeed, dream: cmdDream,
-    config: cmdConfig, grow: cmdGrow, plant: cmdPlant, index: cmdIndex, auto: cmdAuto,
+    config: cmdConfig, grow: cmdGrow, nightly: cmdNightly, gate: cmdGate, plant: cmdPlant, index: cmdIndex, auto: cmdAuto,
+    'hook-recall': cmdHookRecall,
+    mcp: cmdMcp, drift: cmdDrift,
     events: cmdEvents,
     tip: cmdTip, use: cmdUse, finish: cmdFinish, unfinish: cmdUnfinish,
     'plant-branch': cmdPlantBranch, recycle: cmdRecycle, 'plant-project': cmdPlantProject,

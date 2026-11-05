@@ -10,7 +10,9 @@
 import { writeFile } from 'node:fs/promises';
 import { getPath, ensureDirs } from './paths.js';
 import { listSeeds } from './seed.js';
-import { listTrees } from './tree.js';
+import { listTrees, getTreeSeeds } from './tree.js';
+import { summarizeIndex, isProvisional } from './plaque.js';
+import { buildShards } from './shard.js';
 
 /** 索引里最多列多少颗活跃种子（超出只给数量，避免索引本身撑爆上下文）。 */
 export const DEFAULT_MAX_SEEDS = 120;
@@ -47,11 +49,18 @@ export async function renderIndex(opts = {}) {
   if (trees.length) {
     lines.push('', '## 大树');
     for (const t of trees) {
-      // 规则 8：列表只显示树牌，不展开正文
-      const plaque = t.plaque || t.title;
+      // 规则 8：列表只显示坐标牌。牌是指针，正文在这里现读、只截取展示
+      const seeds = await getTreeSeeds(t.id);
+      // 目录是「几 KB 的目录页」，不是详情页：只展开两三条，其余留指针在树文件里
+      const plaque = summarizeIndex(t.index, seeds, {
+        maxRefs: 2,
+        maxChars: 32,
+        fallback: t.curator_note || t.title,
+      });
+      const mark = isProvisional(seeds) ? ' 「尚未验证」' : '';
       const labels = (t.labels || []).join(', ');
       const planter = t.planter ? ` · ${t.planter}` : '';
-      lines.push(`- ${t.id} ${plaque}${labels ? ` — ${labels}` : ''}${planter} (${(t.branches || []).length} 分支 / ${(t.seeds || []).length} 种子)`);
+      lines.push(`- ${t.id} ${plaque}${mark}${labels ? ` — ${labels}` : ''}${planter} (${(t.branches || []).length} 分支 / ${(t.seeds || []).length} 种子)`);
     }
   }
 
@@ -81,5 +90,7 @@ export async function writeIndex(opts = {}) {
   const result = await renderIndex(opts);
   const file = getPath('index');
   await writeFile(file, result.text, 'utf8');
-  return { ...result, path: file };
+  // 目录和分片索引都是派生数据，一起刷新 —— 少了它 recall 会退回全库扫描
+  const shards = await buildShards();
+  return { ...result, path: file, shards };
 }

@@ -1,0 +1,19 @@
+{
+  "name": "dsh-trees",
+  "version": "0.1.0",
+  "description": "Trees adapter for DeepSeek Harness: per-step recall injection and session-end archiving",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  }
+}

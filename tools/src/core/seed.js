@@ -27,6 +27,10 @@ import { parse, stringify } from './frontmatter.js';
 import { getPlanter } from './config.js';
 import { logEvent } from './events.js';
 import { contentHash } from './content.js';
+import { DOMAINS, domainOfLabels } from './plaque.js';
+
+/** 领域闭集，用于校验显式写入的 domain。 */
+const DOMAIN_SET = new Set(DOMAINS);
 
 // ───────────────────────────── 常量 ─────────────────────────────
 
@@ -84,6 +88,7 @@ const FIELD_ORDER = Object.freeze([
   'last_watered',
   'from_tree',
   'from_branch',
+  'domain',
   'planter',
   'visibility',
   'content_hash',
@@ -391,6 +396,9 @@ function normalizeSeed(raw, id, body, fallbackDate) {
     last_watered: toDateStr(raw.last_watered) ?? born,
     from_tree: toStr(raw.from_tree),
     from_branch: toStr(raw.from_branch),
+    // 领域是分区键：显式写过的优先（人可以纠正分类），否则从标签确定性推导。
+    // 「显式优先」是必须的 —— 不然人改过的分类下次读盘就被覆盖了。
+    domain: DOMAIN_SET.has(toStr(raw.domain)) ? toStr(raw.domain) : domainOfLabels(toStrList(raw.labels)),
     planter: toStr(raw.planter),
     // 默认私有：只有显式 share 过的种子才会进发布包
     visibility: raw.visibility === 'shared' ? 'shared' : 'private',
@@ -449,6 +457,12 @@ function serialize(seed) {
   /** @type {Record<string, any>} */
   const data = {};
   for (const key of FIELD_ORDER) data[key] = seed[key];
+
+  // domain 是**推导值**（从标签算出来的）。如果把它原样写进文件，
+  // 下次读盘时它就成了"显式指定"，永远不再跟着词表重算 ——
+  // 改一次词表，全库的领域还停在旧值上，而且没有任何办法批量更新。
+  // 所以：只有人显式改过（和推导结果不同）才落盘，否则省略。
+  if (data.domain === domainOfLabels(data.labels)) delete data.domain;
   for (const [key, value] of Object.entries(seed)) {
     if (!FIELD_ORDER.includes(key) && key !== 'body') data[key] = value;
   }
@@ -772,9 +786,12 @@ export async function deleteSeed(id) {
  *
  * @param {string} id
  * @param {boolean} [ok=true]
+ * @param {{domain?:string, tree?:string}} [opts] 这条经验是在哪个领域/项目里被用上的。
+ *   必须记 —— 没有它就无法区分「这颗种子在这个领域行、在那个领域不行」，
+ *   也无法识别「某个经验正在跨域迁移 = 新方向」。
  * @returns {Promise<Seed|null>} 更新后的种子；不存在返回 null
  */
-export async function waterSeed(id, ok = true) {
+export async function waterSeed(id, ok = true, opts = {}) {
   const seed = await readSeed(id);
   if (!seed) return null;
 
@@ -795,6 +812,9 @@ export async function waterSeed(id, ok = true) {
   await logEvent(ok ? 'water' : 'fail', {
     actor: saved.planter || '',
     seed: saved.id,
+    // 使用上下文：在水里记，不在种子身上记 —— 种子只有一个领域，但可以在多个领域被用
+    domain: DOMAIN_SET.has(opts.domain) ? opts.domain : 'unknown',
+    tree: opts.tree || '',
     title: saved.title,
     watered: saved.watered,
     failed: saved.failed,

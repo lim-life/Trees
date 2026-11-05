@@ -85,7 +85,8 @@ export async function shareTree(treeId) {
     tree: {
       id: sharedTree.id,
       title: sharedTree.title,
-      plaque: sharedTree.plaque,
+      index: sharedTree.index,
+      curator_note: sharedTree.curator_note,
       labels: sharedTree.labels,
       sha256: sha256(treeText),
     },
@@ -97,7 +98,7 @@ export async function shareTree(treeId) {
   await writeFile(path.join(dir, 'PUBLISH.md'), [
     `# ${sharedTree.title}`,
     '',
-    sharedTree.plaque ? `> ${sharedTree.plaque}` : '',
+    sharedTree.curator_note ? `> ${sharedTree.curator_note}` : '',
     '',
     `Trees share bundle (${SHARE_FORMAT}) — ${entries.length} seeds.`,
     '',

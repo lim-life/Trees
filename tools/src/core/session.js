@@ -14,10 +14,10 @@
  *   - 一个会话一个节点；重复触发只跳过已经存在的节点。
  *   - 会话文本发送前遮掉疑似密钥。
  */
-import { readFile, appendFile, mkdir } from 'node:fs/promises';
+import { readFile, appendFile, mkdir, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import { createTree, readTree } from './tree.js';
 import { readConfig } from './config.js';
 import {
@@ -34,6 +34,29 @@ const KEY_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 /** 回写日志的位置。 */
 export function autoLogPath() {
   return path.join(os.homedir(), '.trees', 'auto.log');
+}
+
+/** 已录会话的指纹表：同一份对话被 hook 重复触发时只记一次。 */
+function recordedPath() {
+  return process.env.TREES_RECORDED || path.join(os.homedir(), '.trees', 'recorded.json');
+}
+
+async function readRecorded() {
+  try {
+    const obj = JSON.parse(await readFile(recordedPath(), 'utf8'));
+    return obj && typeof obj === 'object' ? obj : {};
+  } catch {
+    return {};
+  }
+}
+
+async function markRecorded(hash, key) {
+  const all = await readRecorded();
+  all[hash] = key;
+  try {
+    await mkdir(path.dirname(recordedPath()), { recursive: true });
+    await writeFile(recordedPath(), `${JSON.stringify(all, null, 2)}\n`, 'utf8');
+  } catch { /* 指纹写不了不影响主流程 */ }
 }
 
 /** 把可能像密钥的片段遮掉 —— 会话文本要发给模型，别把 key 一起送出去。 */
@@ -235,6 +258,15 @@ export async function runAuto(opts = {}) {
   const short = material.length < minChars;
   if (short && !parentKey) return { skipped: `对话太短（${material.length} 字）` };
 
+  // 同一份对话被 SessionEnd 重复触发时，只记一次（两个 hook 同时结束时很常见）
+  const materialHash = createHash('sha256').update(material, 'utf8').digest('hex');
+  if (!opts.dryRun) {
+    const recorded = await readRecorded();
+    if (recorded[materialHash]) {
+      return { skipped: `这次对话已经记录过（${recorded[materialHash]}）` };
+    }
+  }
+
   let summary = {
     title: '', summary: '', project_status: 'unknown', status_reason: '',
     open_threads: [], explicit_complete: false,
@@ -254,38 +286,42 @@ export async function runAuto(opts = {}) {
 
   const key = await allocateKey();
   const title = summary.title ? `${summary.title} · ${today()}` : `会话 · ${today()}`;
-  const tree = await createTree({
-    id: key,
-    title,
-    type: '会话',
-    kind: 'session',
-    root_path: cwd,
-    continues_from: parentKey,
-    project_status: summary.project_status,
-    status_reason: summary.status_reason,
-    open_threads: summary.open_threads,
-    explicit_complete: summary.explicit_complete,
-    body: [
-      '## 本次做了什么',
-      summary.summary || '（未总结）',
-      '',
-      '## 关键决策',
-      '',
-      '',
-      '## 下一步',
-      (summary.open_threads || []).map((x) => `- ${x}`).join('\n') || '（无）',
-      '',
-    ].join('\n'),
-  });
 
-  if (!opts.dryRun) await writeLastKey(cwd, key);
-  await appendLog(
-    `session ${opts.transcript ? path.basename(opts.transcript) : 'manual'} → ${key}`
-    + `（${summary.project_status}${parentKey ? ` ← ${parentKey}` : ''}）`,
-    opts.logPath,
-  );
+  // dry-run 只算不写：以前这里无条件 createTree，结果 --dry-run 也往库里塞了树
+  if (!opts.dryRun) {
+    await createTree({
+      id: key,
+      title,
+      type: '会话',
+      kind: 'session',
+      root_path: cwd,
+      continues_from: parentKey,
+      project_status: summary.project_status,
+      status_reason: summary.status_reason,
+      open_threads: summary.open_threads,
+      explicit_complete: summary.explicit_complete,
+      body: [
+        '## 本次做了什么',
+        summary.summary || '（未总结）',
+        '',
+        '## 关键决策',
+        '',
+        '',
+        '## 下一步',
+        (summary.open_threads || []).map((x) => `- ${x}`).join('\n') || '（无）',
+        '',
+      ].join('\n'),
+    });
+    await writeLastKey(cwd, key);
+    await markRecorded(materialHash, key);
+    await appendLog(
+      `session ${opts.transcript ? path.basename(opts.transcript) : 'manual'} → ${key}`
+      + `（${summary.project_status}${parentKey ? ` ← ${parentKey}` : ''}）`,
+      opts.logPath,
+    );
+  }
 
-  const verdict = await evaluateChain(key);
+  const verdict = opts.dryRun ? { ready: false, reason: 'dry-run' } : await evaluateChain(key);
   let mergedInto = null;
   if (!opts.dryRun && verdict.ready && cfg.autoFinish === true) {
     try {
@@ -303,7 +339,7 @@ export async function runAuto(opts = {}) {
 
   return {
     key,
-    treeId: tree.id,
+    treeId: opts.dryRun ? null : key,
     projectStatus: summary.project_status,
     openThreads: summary.open_threads,
     mergedInto,
