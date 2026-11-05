@@ -10,7 +10,7 @@
     "node": ">=20"
   },
   "license": "MIT",
-  "author": "张子翔 <zzx060427@outlook.com>",
+  "author": "张子翔 <lim-life@users.noreply.github.com>",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/lim-life/Trees.git"
@@ -18,7 +18,7 @@
   "homepage": "https://github.com/lim-life/Trees#readme",
   "bugs": {
     "url": "https://github.com/lim-life/Trees/issues",
-    "email": "zzx060427@outlook.com"
+    "email": "lim-life@users.noreply.github.com"
   },
   "keywords": [
     "ai-agents",

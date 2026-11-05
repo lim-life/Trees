@@ -2,7 +2,7 @@
 
 这是个**早期项目**，最需要的就是被人用坏。任何形式的反馈都欢迎。
 
-📮 联系作者：`zzx060427@outlook.com` ・ 或者直接开 [issue](https://github.com/lim-life/Trees/issues)
+📮 联系作者：`lim-life@users.noreply.github.com` ・ 或者直接开 [issue](https://github.com/lim-life/Trees/issues)
 
 ---
 

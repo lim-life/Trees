@@ -29,3 +29,7 @@ Thumbs.db
 
 # 整个数据区都不进仓库（避免 shards.json 这类派生文件漏网）
 **/forest/
+
+# 本机量化浇水脚本，不进公开仓库
+water-quant.cmd
+tools/water-quant.cmd

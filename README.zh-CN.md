@@ -505,7 +505,7 @@ P2P 全节点网络 · 代币发行与融资 · 全球实时同步 · 一次覆�
 
 ## 参与
 
-可以通过 `zzx060427@outlook.com` 联系我，也欢迎直接开 [issue](https://github.com/lim-life/Trees/issues)。
+可以通过 `lim-life@users.noreply.github.com` 联系我，也欢迎直接开 [issue](https://github.com/lim-life/Trees/issues)。
 
 项目还早，现在最缺的是有人把它用到自己的活里，碰到问题再告诉我。
 

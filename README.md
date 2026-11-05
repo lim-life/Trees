@@ -499,7 +499,7 @@ I need more people to try it before I can know whether that bet holds up. That's
 
 ## Contributing
 
-You can reach me at `zzx060427@outlook.com`, or open an [issue](https://github.com/lim-life/Trees/issues).
+You can reach me at `lim-life@users.noreply.github.com`, or open an [issue](https://github.com/lim-life/Trees/issues).
 
 It's early. The most useful contribution right now is to use Trees on your own work and tell me where it breaks.
 
